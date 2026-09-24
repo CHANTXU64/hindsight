@@ -130,7 +130,17 @@ def test_session_switch_starts_a_new_document(provider):
 
 def test_register_exposes_the_provider_to_hermes():
     registered = []
-    plugin.register(type("Ctx", (), {"register_memory_provider": lambda _self, p: registered.append(p)})())
+    plugin.register(
+        type(
+            "Ctx",
+            (),
+            {
+                "register_memory_provider": lambda _self, p: registered.append(p),
+                # Hermes forwards every other register_* call to its PluginContext.
+                "register_auxiliary_task": lambda _self, *a, **k: None,
+            },
+        )()
+    )
     assert registered and registered[0].name == "hindsight"
 
 
