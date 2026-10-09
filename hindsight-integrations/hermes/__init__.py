@@ -111,37 +111,20 @@ def _cloud_api_key(config: dict) -> str:
 
 
 def _maybe_upgrade_client() -> None:
-    """Auto-upgrade an outdated hindsight-client via the environment-aware lazy_deps
-    installer (sealed hosted venvs redirect to the durable target)."""
+    """Prepare an outdated remote client through the host's dependency manager."""
     try:
         from importlib.metadata import version as pkg_version
-
         from packaging.version import Version
 
-        installed = pkg_version("hindsight-client")
-        if Version(installed) < Version(_MIN_CLIENT_VERSION):
-            logger.warning(
-                "hindsight-client %s is outdated (need >=%s), attempting upgrade...", installed, _MIN_CLIENT_VERSION
-            )
-            from tools.lazy_deps import install_specs
+        if Version(pkg_version("hindsight-client")) >= Version(_MIN_CLIENT_VERSION):
+            return
+        from .dependencies import prepare_remote_dependencies
 
-            outcome = install_specs([f"hindsight-client>={_MIN_CLIENT_VERSION}"], timeout=120)
-            if outcome.ok:
-                logger.info("hindsight-client upgraded to >=%s", _MIN_CLIENT_VERSION)
-            elif outcome.blocked:
-                logger.warning(
-                    "Auto-upgrade unavailable: %s. Run: uv pip install 'hindsight-client>=%s'",
-                    outcome.reason,
-                    _MIN_CLIENT_VERSION,
-                )
-            else:
-                logger.warning(
-                    "Auto-upgrade failed: %s. Run: uv pip install 'hindsight-client>=%s'",
-                    (outcome.stderr or "").strip() or "install error",
-                    _MIN_CLIENT_VERSION,
-                )
-    except Exception:
-        pass  # packaging not available or other issue — proceed anyway
+        ready, notice = prepare_remote_dependencies(explicit=False)
+        logger.log(logging.INFO if ready else logging.WARNING, "%s", notice)
+    except Exception as exc:
+        # Startup remains nonfatal, but a failed preparation must be visible.
+        logger.warning("Could not prepare Hindsight client dependencies: %s", exc)
 
 
 # update_mode='append' capability (Hindsight >= 0.5.0), cached per (API URL, key fingerprint)

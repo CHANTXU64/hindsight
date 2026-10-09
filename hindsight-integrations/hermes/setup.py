@@ -18,7 +18,6 @@ from .settings import (
     _DEFAULT_IDLE_TIMEOUT,
     _DEFAULT_LOCAL_URL,
     _DEFAULT_TIMEOUT,
-    _MIN_CLIENT_VERSION,
     _PROVIDER_DEFAULT_MODELS,
 )
 
@@ -112,18 +111,25 @@ def run_setup(provider, hermes_home: str, config: dict) -> None:
         provider_config["llm_provider"] = llm_provider
 
     print("\n  Checking dependencies...")
-    # Environment-aware install: sealed hosted venvs redirect to the durable data volume.
-    from tools.lazy_deps import install_specs
+    if mode == "local_embedded":
+        # The embedded-server mode retains its legacy installer; its PM
+        # migration is deliberately separate from remote-client support.
+        from tools.lazy_deps import install_specs
 
-    deps = ["hindsight-all"] if mode == "local_embedded" else [f"hindsight-client>={_MIN_CLIENT_VERSION}"]
-    outcome = install_specs(deps, timeout=120)
-    if outcome.ok:
-        print("  ✓ Dependencies up to date")
-    elif outcome.blocked:
-        print(f"  ⚠ Cannot install dependencies: {outcome.reason}")
+        deps = ["hindsight-all"]
+        outcome = install_specs(deps, timeout=120)
+        if outcome.ok:
+            print("  ✓ Dependencies up to date")
+        elif outcome.blocked:
+            print(f"  ⚠ Cannot install dependencies: {outcome.reason}")
+        else:
+            print(f"  ⚠ Install failed:\n{(outcome.stderr or '').strip()}")
+            print(f"  Run manually: uv pip install --python {sys.executable} {' '.join(deps)}")
     else:
-        print(f"  ⚠ Install failed:\n{(outcome.stderr or '').strip()}")
-        print(f"  Run manually: uv pip install --python {sys.executable} {' '.join(deps)}")
+        from .dependencies import prepare_remote_dependencies
+
+        ready, notice = prepare_remote_dependencies(explicit=True)
+        print(f"  {'✓' if ready else '⚠'} {notice}")
 
     if mode == "cloud":
         print("\n  Get your API key at https://ui.hindsight.vectorize.io\n")

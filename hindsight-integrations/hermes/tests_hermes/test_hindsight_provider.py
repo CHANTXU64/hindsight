@@ -181,12 +181,12 @@ def _assert_cloud_client_dependency_declared_for_installer(tmp_path, monkeypatch
     from packaging.requirements import Requirement
     from packaging.version import Version
 
-    from hermes_cli.plugin_python_deps import read_declaration
+    from pm.plugin_declarations import read_python_declaration
     from plugins.memory.hindsight.settings import _MIN_CLIENT_VERSION
 
-    declaration = read_declaration(Path(hindsight_module.__file__).parent)
-    clients = [Requirement(spec) for spec in declaration.specs if Requirement(spec).name == "hindsight-client"]
-    assert declaration.wants_install and len(clients) == 1
+    declaration = read_python_declaration(Path(hindsight_module.__file__).parent)
+    clients = [Requirement(spec) for spec in declaration.requirements if Requirement(spec).name == "hindsight-client"]
+    assert declaration.is_member and len(clients) == 1
     floors = [Version(s.version) for s in clients[0].specifier if s.operator in (">=", "==", "~=")]
     assert floors and min(floors) >= Version(_MIN_CLIENT_VERSION)
 
@@ -1322,11 +1322,10 @@ class TestPostSetupEnvEncoding:
         monkeypatch.setattr("hermes_cli.memory_setup._curses_select",
                             lambda *a, **kw: 0)  # cloud mode
         monkeypatch.setattr("hermes_cli.config.save_config", lambda c: None)
-        # Skip the dependency install (now routed through lazy_deps, NS-605).
-        import tools.lazy_deps as lazy_deps_mod
+        # This test owns env-file encoding, not dependency provisioning.
         monkeypatch.setattr(
-            lazy_deps_mod, "install_specs",
-            lambda *a, **kw: lazy_deps_mod.InstallSpecsResult(ok=True),
+            "plugins.memory.hindsight.dependencies.prepare_remote_dependencies",
+            lambda **kw: (True, "Client already available"),
         )
         # First line: API key prompt (readline). Second line: API URL (input).
         monkeypatch.setattr(sys, "stdin", io.StringIO("sk-new\n\n"))
@@ -1349,67 +1348,58 @@ class TestPostSetupEnvEncoding:
         assert "﻿" not in content
 
 
-class TestClientAutoUpgradeRoutesThroughLazyDeps:
-    """The initialize()-time hindsight-client auto-upgrade must go through
-    lazy_deps.install_specs() (environment-aware, durable-target on sealed
-    hosted venvs) — never a direct `uv pip install --python sys.executable`
-    subprocess, which fails with EROFS/EACCES on immutable images (NS-605)."""
+class TestClientAutoUpgradeRoutesThroughPM:
+    """Runtime preparation uses the declared PM union, never raw pip or live import replacement."""
 
-    def _init_with_outdated_client(self, tmp_path, monkeypatch, outcome):
+    def _init_with_outdated_client(self, tmp_path, monkeypatch, error=None):
         import importlib.metadata as md
         import subprocess as subprocess_mod
-        import tools.lazy_deps as lazy_deps_mod
+        import pm
+        from plugins.memory.hindsight import dependencies
 
         config_path = tmp_path / "hindsight" / "config.json"
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(json.dumps({"mode": "cloud"}))
-        monkeypatch.setattr(
-            "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
-        )
-
-        # Simulate an installed-but-outdated client.
-        monkeypatch.setattr(md, "version", lambda name: "0.0.1")
-
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+        real_version = md.version
+        monkeypatch.setattr(md, "version", lambda name: "0.0.1" if name == "hindsight-client" else real_version(name))
+        monkeypatch.setattr(dependencies, "version", md.version)
         calls = []
-        monkeypatch.setattr(
-            lazy_deps_mod, "install_specs",
-            lambda specs, **kw: calls.append(tuple(specs)) or outcome,
-        )
 
-        # Regression guard: no direct pip subprocess may run.
-        def _no_subprocess(*a, **kw):  # pragma: no cover - fails loudly
-            raise AssertionError(f"unexpected subprocess.run during auto-upgrade: {a}")
-        monkeypatch.setattr(subprocess_mod, "run", _no_subprocess)
+        def sync(**kwargs):
+            calls.append(kwargs)
+            if error:
+                raise RuntimeError(error)
 
+        monkeypatch.setattr(pm, "sync_venv", sync)
+
+        def no_raw_install(*a, **kw):
+            raise AssertionError("unexpected raw or retired dependency installer")
+
+        monkeypatch.setattr(subprocess_mod, "run", no_raw_install)
+        monkeypatch.setattr("tools.lazy_deps.install_specs", no_raw_install)
         provider = HindsightMemoryProvider()
         provider.initialize(session_id="s", hermes_home=str(tmp_path), platform="cli")
         return calls
 
-    def test_upgrade_uses_install_specs_not_subprocess(self, tmp_path, monkeypatch):
-        from plugins.memory.hindsight import _MIN_CLIENT_VERSION
-        from tools.lazy_deps import InstallSpecsResult
-
-        calls = self._init_with_outdated_client(
-            tmp_path, monkeypatch, InstallSpecsResult(ok=True)
-        )
-        assert calls == [(f"hindsight-client>={_MIN_CLIENT_VERSION}",)]
-
-    def test_blocked_upgrade_is_nonfatal_and_surfaces_reason(
-        self, tmp_path, monkeypatch, caplog
-    ):
+    def test_upgrade_prepares_pm_environment_not_live_imports(self, tmp_path, monkeypatch, caplog):
         import logging
-        from tools.lazy_deps import InstallSpecsResult
+
+        with caplog.at_level(logging.WARNING):
+            calls = self._init_with_outdated_client(tmp_path, monkeypatch)
+        assert calls == [{"explicit": False}]
+        assert "Restart Hermes" in caplog.text
+        assert "upgraded to" not in caplog.text
+
+    def test_blocked_upgrade_is_nonfatal_and_surfaces_reason(self, tmp_path, monkeypatch, caplog):
+        import logging
 
         with caplog.at_level(logging.WARNING):
             calls = self._init_with_outdated_client(
-                tmp_path, monkeypatch,
-                InstallSpecsResult(ok=False, blocked=True,
-                                   reason="runtime installs are disabled on this deployment"),
+                tmp_path, monkeypatch, "runtime installs are disabled on this deployment",
             )
-        assert len(calls) == 1  # attempted exactly once, init still completed
-        assert any("runtime installs are disabled" in r.getMessage()
-                   for r in caplog.records)
-
+        assert calls == [{"explicit": False}]
+        assert "runtime installs are disabled" in caplog.text
 
 
 class TestMultiplexBackgroundScope:
