@@ -45,7 +45,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Literal, Union, cast
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 
@@ -391,19 +391,45 @@ def _correction_prompt(error: Exception, rejected: list[RejectedOperation]) -> s
     return "\n".join(lines)
 
 
-def _unreachable_correction_prompt(skipped: list[dict[str, Any]], document: StructuredDocument) -> str:
-    """The follow-up turn when every operation pointed at something the document lacks."""
-    lines = [
-        "That reply could not be used: every operation refers to a section or block "
-        "that is not in the document, so nothing you sent has been applied.",
-        "",
-        "What failed:",
-    ]
+def _is_bad_reference(entry: dict[str, Any]) -> bool:
+    """A skip caused by an id the document does not have (a typo), not by the op's content.
+
+    Matches the reasons ``apply_operations`` records for unresolvable section and
+    block references.
+    """
+    reason = str(entry.get("reason", ""))
+    return reason.startswith("unknown ") or " belongs to section " in reason
+
+
+def _unreachable_correction_prompt(
+    skipped: list[dict[str, Any]], document: StructuredDocument, *, any_applied: bool
+) -> str:
+    """The follow-up turn when operations pointed at something the document lacks."""
+    if any_applied:
+        opening = (
+            "Some operations in that reply refer to a section or block that is not in "
+            "the document, so they would be dropped while the rest are applied."
+        )
+    else:
+        opening = (
+            "That reply could not be used: every operation refers to a section or block "
+            "that is not in the document, so nothing you sent has been applied."
+        )
+    lines = [opening, "", "What failed:"]
     for entry in skipped:
         op = {k: v for k, v in entry.items() if k != "reason"}
         lines.append(f"- {entry.get('reason')}; you sent: {json.dumps(op, ensure_ascii=False, default=str)[:600]}")
     lines += ["", "The document's sections are:"]
     lines += [f"- {section.id}: {section.heading}" for section in document.sections]
+    # A mistyped block id (#4829) is fixed by seeing the real ones, so list the
+    # blocks of every section a failed block op named.
+    for section_id in dict.fromkeys(e.get("section_id") for e in skipped if e.get("block_id")):
+        # `section_id` is a dict read, filtered above to entries that carry one.
+        section = document.section_by_id(cast(str, section_id))
+        if section is None:
+            continue
+        lines += ["", f"The blocks of section {section.id} are:"]
+        lines += [f"- {block.id}: {block.text[:80]!r}" for block in section.blocks]
     lines += [
         "",
         "Send the COMPLETE list again, with every section_id and block_id copied "
@@ -411,6 +437,33 @@ def _unreachable_correction_prompt(skipped: list[dict[str, Any]], document: Stru
         "``operations``. Emit no prose outside the JSON object.",
     ]
     return "\n".join(lines)
+
+
+def _replayed_reply_text(content: Any) -> str:
+    """The refused reply as text, for the retry's assistant turn.
+
+    ``content`` is not necessarily the text the model wrote. A provider only
+    parses the body when the call set a ``response_format`` — a dict under
+    ``skip_validation``, the validated model otherwise — and the delta call site
+    sets one. Replaying that object unchanged put it in ``messages[N].content``,
+    which every strict request-body validator types as a string or a list of
+    content blocks, so the retry was refused with a 422 before it was ever sent;
+    the caller's own retry ladder then re-sent the identical body and the delta
+    was dropped under a refresh that reported success (#4965).
+
+    Serialized, not stringified, so the model reads back the document it wrote
+    rather than a repr of it; and passed through untouched when it already is
+    text, so a provider that returned text still sees the exact bytes it sent.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, BaseModel):
+        return content.model_dump_json()
+    if content is None:
+        return ""
+    if isinstance(content, (dict, list)):
+        return json.dumps(content, ensure_ascii=False)
+    return str(content)
 
 
 async def request_delta_operations(
@@ -441,13 +494,17 @@ async def request_delta_operations(
 
     The retry APPENDS to the first request and never rewrites it, so the system
     prompt and the whole document stay a byte-identical prefix and the provider's
-    prompt cache still covers them on the second call.
+    prompt cache still covers them on the second call. The one appended turn the
+    caller has to rebuild is the model's own reply, and it is rebuilt as text —
+    see ``_replayed_reply_text`` for why a parsed reply cannot be replayed as one.
 
-    ``document``, when given, also refuses a reply that parses but cannot land:
-    every operation names a section or block the document does not have (#4206).
-    The retry quotes those references and lists the real section ids. Only the
-    refresh's edit pass passes it — for the retraction pass, touching nothing is a
-    legitimate answer.
+    ``document``, when given, also refuses a reply that parses but cannot fully
+    land: an operation names a section or block the document does not have — all
+    of them (#4206), or just one mistyped block id among good ops (#4829), which
+    would otherwise leave the block it meant to replace in place under a clean
+    refresh. The retry quotes those references and lists the real section and
+    block ids. Only the refresh's edit pass passes it — for the retraction pass,
+    touching nothing is a legitimate answer.
     """
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
     first = await llm.call(messages=messages, scope=scope, **call_kwargs)
@@ -461,17 +518,23 @@ async def request_delta_operations(
         if document is None or not op_list.operations:
             return op_list
         outcome = apply_operations(document, op_list.operations)
-        if outcome.applied:
+        # With nothing applied, every skip is quoted back; otherwise only the ones a
+        # corrected id can fix — an op skipped for its content would be skipped again.
+        unreachable = (
+            [entry for entry in outcome.skipped if _is_bad_reference(entry)] if outcome.applied else outcome.skipped
+        )
+        if not unreachable:
             return op_list
         logger.warning(
-            "[STRUCTURED_DELTA] %s reply refused (all %d op(s) reference missing sections/blocks); asking again",
+            "[STRUCTURED_DELTA] %s reply refused (%d of %d op(s) reference missing sections/blocks); asking again",
             scope,
-            len(outcome.skipped),
+            len(unreachable),
+            len(op_list.operations),
         )
-        correction = _unreachable_correction_prompt(outcome.skipped, document)
+        correction = _unreachable_correction_prompt(unreachable, document, any_applied=bool(outcome.applied))
     retry_messages = [
         *messages,
-        {"role": "assistant", "content": first.content or ""},
+        {"role": "assistant", "content": _replayed_reply_text(first.content)},
         {"role": "user", "content": correction},
     ]
     second = await llm.call(messages=retry_messages, scope=scope, **call_kwargs)
@@ -548,6 +611,10 @@ def apply_operations(
     # owned one is later removed, so two ops in the same batch can never be
     # given the same id.
     reserved_ids: set[str] = set(new_doc.block_ids())
+    # The model only sees a new section's heading when it emits a batch, not
+    # the collision-safe id assigned below. Remember headings created earlier
+    # in this batch so a chain of add_section operations can target them.
+    added_section_ids: dict[str, str] = {}
 
     def skip(op: Operation, reason: str) -> None:
         entry = _op_summary(op)
@@ -560,6 +627,16 @@ def apply_operations(
         block_id = make_block_id(normalized, reserved_ids)
         reserved_ids.add(block_id)
         return Block(id=block_id, text=normalized)
+
+    def resolve_section_anchor(anchor: str) -> int | None:
+        # An exact id always wins. After that, models often copy the
+        # human-readable heading instead of the id: try the id assigned to a
+        # section added earlier in this batch, then the slug, then the heading
+        # itself (which covers sections whose id is not their slug).
+        for candidate in (anchor, added_section_ids.get(anchor), slugify_heading(anchor)):
+            if candidate is not None and (index := new_doc.section_index(candidate)) is not None:
+                return index
+        return next((i for i, section in enumerate(new_doc.sections) if section.heading == anchor), None)
 
     def resolve_block(op: Operation, section: Section, block_id: str) -> int | None:
         index = section.block_index(block_id)
@@ -673,7 +750,7 @@ def apply_operations(
             if op.after_section_id is None:
                 new_doc.sections.append(new_section)
             else:
-                idx = new_doc.section_index(op.after_section_id)
+                idx = resolve_section_anchor(op.after_section_id)
                 if idx is None:
                     skip(op, f"unknown after_section_id: {op.after_section_id}")
                     continue
@@ -681,6 +758,9 @@ def apply_operations(
             entry = _op_summary(op)
             entry["assigned_id"] = section_id
             applied.append(entry)
+            added_section_ids[op.heading] = section_id
+            if op.new_id is not None:
+                added_section_ids[op.new_id] = section_id
             continue
 
         if isinstance(op, RemoveSectionOp):

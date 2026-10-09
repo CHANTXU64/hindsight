@@ -8,7 +8,7 @@ from test_hindsight_provider import provider
 
 
 def test_hindsight_retain_tool_preserves_bank_tags_metadata_and_unicode(provider):
-    provider._bank_id = "Hermes"
+    provider._apply_connection_settings({"bank_id": "Hermes"})
     provider._retain_tags = ["default-tag"]
     provider._session_id = "session-1"
     provider._platform = "telegram"

@@ -12,7 +12,7 @@ When you **retain** content, Hindsight doesn't just store the raw text—it inte
 Learn about fact extraction, entity resolution, and graph construction in the [Retain Architecture](../retain.md) guide.
 > **💡 Prerequisites**
 >
-Make sure you've completed the [Quick Start](./quickstart) to install the client and start the server.
+Make sure you've completed the [Quick Start](./quickstart.md) to install the client and start the server.
 ## Store a Document
 
 A single retain call accepts one or more **items**. Each item is a piece of raw content — a conversation, a document, a note — that Hindsight will analyze and decompose into one or many memories. The content itself is never stored verbatim; what gets stored are the structured facts the LLM extracts from it.
@@ -226,7 +226,17 @@ A caller-supplied string that groups one or more items under a logical document.
 
 When you provide a `document_id`, Hindsight upserts the document: if a document with that ID already exists in the bank, it and all its associated memories are deleted before the new content is processed and inserted. This means you can safely re-run retain on updated content — for example, a chat thread that grew since last time — without accumulating duplicate memories.
 
-If you omit `document_id`, Hindsight assigns a random UUID per request, so re-ingesting the same content will create duplicate memories.
+If you omit `document_id`, Hindsight assigns a random UUID, so re-ingesting the same content will create duplicate memories. How items without a `document_id` are grouped depends on the rest of the request:
+
+| Request | Result |
+|---------|--------|
+| No item has a `document_id` | All items go into **one** new document. A request too large for one pass (over `HINDSIGHT_API_RETAIN_BATCH_TOKENS`) is split into parts, and each part becomes its own document. |
+| Some items have a `document_id`, others don't | Each item without one becomes its **own** new document. It is never folded into another item's document, so replacing or deleting that document leaves it alone. |
+| Items share the same `document_id` | Those items go into that one document, in request order. |
+
+An item with an attachment always gets its own document when it has no `document_id`, so it counts as an item *with* one in the table above.
+
+To keep every item separate, give each one its own `document_id`. To put several items in one document, give them the same `document_id`.
 
 ### update_mode
 
@@ -267,7 +277,7 @@ Set `resolve_entities: false` when the names you are passing are authoritative a
 
 This applies **only to the entities you supply**. Auto-extracted entities are always resolved, because they are the extractor's guess at a name rather than yours — turning resolution off for them would fill the bank with near-duplicate entities.
 
-The same flag exists on [editing a memory](./memories#resolving-entity-names), where it matters most: a correction you type by hand is exactly the case where a similar existing entity should not win.
+The same flag exists on [editing a memory](./memories.md#resolving-entity-names), where it matters most: a correction you type by hand is exactly the case where a similar existing entity should not win.
 
 ### tags and document_tags
 
@@ -275,11 +285,11 @@ Tags control **visibility scoping** — which memories are visible during recall
 
 Use consistent naming patterns to keep tag filtering predictable. Common conventions: `user:<id>` for per-user scoping, `session:<id>` for session isolation, `room:<id>` for chat rooms, `topic:<name>` for category filtering. The bank also exposes a list-tags endpoint that returns all tags with their memory counts, useful for UI autocomplete or wildcard expansion.
 
-See [Recall API](./recall#tags) for filtering by tags during retrieval.
+See [Recall API](./recall.md#tags) for filtering by tags during retrieval.
 
 ### observation_scopes
 
-Controls which [observations](../observations) this memory contributes to during consolidation. Each scope runs an independent pass, creating or updating observations tagged with only that scope's tags.
+Controls which [observations](../observations.md) this memory contributes to during consolidation. Each scope runs an independent pass, creating or updating observations tagged with only that scope's tags.
 
 > **ℹ️ Scope isolation**
 >
@@ -560,7 +570,7 @@ fmt.Println("Operation IDs:", fileResp.GetOperationIds()) // Track processing vi
 
 > **ℹ️ File Storage**
 >
-Uploaded files are stored server-side (PostgreSQL by default, or S3/GCS/Azure for production). Configure storage via `HINDSIGHT_API_FILE_STORAGE_TYPE`. See [Configuration](../configuration#file-processing) for details.
+Uploaded files are stored server-side (PostgreSQL by default, or S3/GCS/Azure for production). Configure storage via `HINDSIGHT_API_FILE_STORAGE_TYPE`. See [Configuration](../configuration.md#file-processing) for details.
 ---
 
 ## Async Ingestion

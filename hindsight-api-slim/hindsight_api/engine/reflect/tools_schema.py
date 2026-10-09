@@ -19,7 +19,9 @@ TOOL_SEARCH_MENTAL_MODELS = {
         "description": (
             "Search user-curated mental models (stored reflect responses). These are high-quality, manually created "
             "summaries about specific topics. Use FIRST when the question might be covered by an "
-            "existing mental model. Returns mental models with their content and last refresh time."
+            "existing mental model. Returns the best-matching page IN FULL, and a SNIPPET of each other hit "
+            "with its size and last refresh time — call read_mental_models to read in full any of those that "
+            "look like they answer the question."
         ),
         "parameters": {
             "type": "object",
@@ -108,6 +110,38 @@ TOOL_RECALL = {
     },
 }
 
+TOOL_READ_MENTAL_MODELS = {
+    "type": "function",
+    "function": {
+        "name": "read_mental_models",
+        "description": (
+            "Read mental models in full, by id, after search_mental_models showed you their snippets. "
+            "Ask only for the ones whose snippet looks relevant: a page is long, and every page you read "
+            "stays in the conversation for the rest of this reflect."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Brief explanation of why you're reading these (for debugging)",
+                },
+                "mental_model_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Ids of the mental models to read, exactly as search_mental_models gave them",
+                },
+                "max_tokens": {
+                    "type": "integer",
+                    "description": "Token budget for the pages returned (default 6000). Reading stops at the "
+                    "first page that would cross it; the rest come back under not_read.",
+                },
+            },
+            "required": ["reason", "mental_model_ids"],
+        },
+    },
+}
+
 TOOL_EXPAND = {
     "type": "function",
     "function": {
@@ -148,11 +182,28 @@ _DONE_ANSWER_DEFAULT_LANGUAGE = (
     "language directive in the system prompt specifies a different language, follow that directive instead."
 )
 
+#: Appended to both ``done`` descriptions. The stopping condition is what the
+#: model weighs at the moment it picks this tool over another search, and
+#: "gathered enough information" alone left *enough* undefined — so a page that
+#: merely shared the question's topic read as enough, and the reflect loop had
+#: already released the forced lower layers (see agent.py's short-circuit, and
+#: #4567). The retrieval-levels section of the system prompt carries the same
+#: rule once; this is the copy at the decision point.
+_DONE_SUFFICIENCY_GATE = (
+    " You have NOT gathered enough while the levels you searched do not STATE the answer: a result that only "
+    "shares the question's topic is not an answer, so search the next level (search_observations, then recall) "
+    "instead of answering around it. Never call done to report that nothing is known unless recall has already "
+    "run on the question's key terms."
+)
+
 TOOL_DONE_ANSWER = {
     "type": "function",
     "function": {
         "name": "done",
-        "description": "Signal completion with your final answer. Use this when you have gathered enough information to answer the question.",
+        "description": (
+            "Signal completion with your final answer. Use this when you have gathered enough information "
+            "to answer the question." + _DONE_SUFFICIENCY_GATE
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -250,7 +301,7 @@ def _done_tool_for_document(base: dict) -> dict:
     params["required"] = ["document"] + [name for name in params.get("required", []) if name != "answer"]
     tool["function"]["description"] = (
         "Signal completion with your final answer, as a structured document. Use this when you have "
-        "gathered enough information to answer the question."
+        "gathered enough information to answer the question." + _DONE_SUFFICIENCY_GATE
     )
     return tool
 
@@ -375,6 +426,8 @@ def get_reflect_tools(
 
     if include_mental_models:
         tools.append(TOOL_SEARCH_MENTAL_MODELS)
+        # Search returns snippets; this is how the model gets a page in full.
+        tools.append(TOOL_READ_MENTAL_MODELS)
     if include_observations:
         tools.append(TOOL_SEARCH_OBSERVATIONS)
     if include_recall:

@@ -24,7 +24,7 @@ def _make_local_embedded_provider(monkeypatch):
     )
     # Pretend the local runtime imports cleanly so initialize() reaches the
     # daemon-start branch instead of bailing on a missing `hindsight` package.
-    monkeypatch.setattr(hindsight, "_check_local_runtime", lambda: (True, None))
+    monkeypatch.setattr(hindsight, "_check_local_runtime", lambda: hindsight.embedded.LocalRuntimeStatus(available=True))
     return HindsightMemoryProvider()
 
 

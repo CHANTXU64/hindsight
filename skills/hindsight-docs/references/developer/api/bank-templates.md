@@ -84,7 +84,7 @@ and everything else inherits from the server/tenant defaults.
 
 The complete, always-current list is the template JSON
 Schema; each field means the same thing it does in
-[Configuration](../configuration.mdx). The most commonly used ones:
+[Configuration](../configuration.md). The most commonly used ones:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -99,7 +99,7 @@ Schema; each field means the same thing it does in
 | `disposition_empathy` | integer (1-5) | How empathetic the disposition is |
 | `enable_observations` | boolean | Toggle observation consolidation |
 | `observations_mission` | string | Controls what gets synthesised into observations |
-| `entity_labels` | object[] | Controlled vocabulary as label groups — see [Memory Banks → entity_labels](./memory-banks#entity-labels) |
+| `entity_labels` | object[] | Controlled vocabulary as label groups — see [Memory Banks → entity_labels](./memory-banks.md#entity-labels) |
 | `entities_allow_free_form` | boolean | Allow entities outside the label vocabulary |
 
 ### Mental Model Fields
@@ -276,9 +276,10 @@ fmt.Println(string(respBody))
 ### Behavior
 
 - **Config**: all `bank` fields are applied as per-bank config overrides
-- **Mental models**: matched by `id` — existing models are updated, new ones are created
-- **Directives**: matched by `name` — existing directives are updated, new ones are created
+- **Mental models**: matched by `id` — new ones are created, existing ones are updated only when their definition differs from the manifest
+- **Directives**: matched by `name` — new ones are created, existing ones are updated only when they differ from the manifest
 - **Async**: mental model content is generated asynchronously. The response includes `operation_ids` to track progress.
+- **Idempotent**: re-importing an unchanged manifest updates nothing and queues no refresh, so applying the same template on every sync costs no LLM calls. Only created or changed mental models are regenerated.
 
 ### Dry Run
 

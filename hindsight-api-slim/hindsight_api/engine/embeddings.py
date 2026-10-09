@@ -34,6 +34,8 @@ from ..config import (
     DEFAULT_EMBEDDINGS_LOCAL_MODEL,
     DEFAULT_EMBEDDINGS_ONNX_BATCH_SIZE,
     DEFAULT_EMBEDDINGS_ONNX_CPU_MEM_ARENA,
+    DEFAULT_EMBEDDINGS_ONNX_CUDA_DEVICE_ID,
+    DEFAULT_EMBEDDINGS_ONNX_DEVICE,
     DEFAULT_EMBEDDINGS_OPENAI_MODEL,
     DEFAULT_EMBEDDINGS_ZEROENTROPY_BATCH_SIZE,
     DEFAULT_EMBEDDINGS_ZEROENTROPY_DIMENSIONS,
@@ -70,7 +72,7 @@ from .remote_retry import (
 from .tei_retry import TEI_KEEPALIVE_EXPIRY_SECONDS, is_retryable_tei_transport_error, tei_retry_delay
 
 if TYPE_CHECKING:
-    from ..config import HindsightConfig
+    from ..config import ConfigLike
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +156,13 @@ class Embeddings(ABC):
     query_prefix: str = ""
     passage_prefix: str = ""
 
+    # The vocabulary this provider's model actually tokenizes with, when it is known
+    # and bundled. Only the input-token cap reads it (see `_truncate_inputs`), so that
+    # a text cut to the model's limit is under the limit *the provider* will count.
+    # None — the default — means "unknown", and the cap falls back to the configured
+    # HINDSIGHT_API_TOKENIZER_ENCODING.
+    tokenizer_encoding: str | None = None
+
     # How many provider requests one encode() call may keep in flight. 1 — the
     # historical, strictly sequential behaviour — is the right default for the
     # in-process backends, which have no round trip to overlap and already batch
@@ -221,12 +230,6 @@ class Embeddings(ABC):
         if not batches:
             return []
 
-        concurrency = min(max(self.max_concurrent_requests, 1), len(batches))
-        if concurrency == 1:
-            # The common case (a single batch, e.g. a recall query) runs inline: no
-            # tasks, no semaphore, byte-identical to the old loop.
-            return [vector for batch in batches for vector in await encode_batch(batch)]
-
         slots = self._get_request_slots()
 
         async def run(batch: list[str]) -> list[list[float]]:
@@ -234,6 +237,12 @@ class Embeddings(ABC):
             # doing its job rather than a reason to widen it.
             async with slots:
                 return await encode_batch(batch)
+
+        concurrency = min(max(self.max_concurrent_requests, 1), len(batches))
+        if concurrency == 1:
+            # The common case (a single batch, e.g. a recall query) runs inline with no
+            # tasks — but still through a slot, or concurrent callers bypass the bound (#5011).
+            return [vector for batch in batches for vector in await run(batch)]
 
         # create_task copies the caller's contextvars into each task, so the per-bank
         # cost attribution they carry (see apply_bank_attribution) reaches every batch.
@@ -460,6 +469,8 @@ class OnnxEmbeddings(Embeddings):
         output_name: str | None = None,
         batch_size: int = DEFAULT_EMBEDDINGS_ONNX_BATCH_SIZE,
         cpu_mem_arena: bool = DEFAULT_EMBEDDINGS_ONNX_CPU_MEM_ARENA,
+        device: str = DEFAULT_EMBEDDINGS_ONNX_DEVICE,
+        cuda_device_id: int = DEFAULT_EMBEDDINGS_ONNX_CUDA_DEVICE_ID,
     ):
         self.model_id = model_id
         self.model_path = model_path
@@ -485,6 +496,12 @@ class OnnxEmbeddings(Embeddings):
             raise ValueError("ONNX embeddings batch_size must be >= 1")
         self.batch_size = batch_size
         self.cpu_mem_arena = cpu_mem_arena
+        if device not in {"cpu", "cuda"}:
+            raise ValueError("ONNX embeddings device must be 'cpu' or 'cuda'")
+        if cuda_device_id < 0:
+            raise ValueError("ONNX CUDA device ID must be >= 0")
+        self.device = device
+        self.cuda_device_id = cuda_device_id
         self._session = None
         self._tokenizer = None
         self._dimension: int | None = dimensions
@@ -507,10 +524,31 @@ class OnnxEmbeddings(Embeddings):
             import onnxruntime as ort
             from transformers import AutoTokenizer
         except ImportError as exc:
+            if self.device == "cuda":
+                raise ImportError(
+                    "CUDA OnnxEmbeddings requires transformers and a compatible onnxruntime-gpu installation "
+                    "with CUDA/cuDNN libraries. See docker/docker-compose/cuda-onnx/ for a custom image recipe; "
+                    "the local-onnx extra alone installs the CPU runtime."
+                ) from exc
             raise ImportError(
                 "onnxruntime and transformers are required for OnnxEmbeddings. "
                 "Install with: pip install 'hindsight-api-slim[local-onnx]'"
             ) from exc
+
+        # Reject a CPU-only runtime before downloading a potentially large graph.
+        providers: list[str | tuple[str, dict[str, str]]] = ["CPUExecutionProvider"]
+        if self.device == "cuda":
+            available_providers = ort.get_available_providers()
+            if "CUDAExecutionProvider" not in available_providers:
+                raise RuntimeError(
+                    "ONNX CUDA execution was requested, but CUDAExecutionProvider is unavailable. "
+                    "Install a compatible onnxruntime-gpu package and CUDA/cuDNN runtime. "
+                    f"Available providers: {available_providers}"
+                )
+            providers = [
+                ("CUDAExecutionProvider", {"device_id": str(self.cuda_device_id)}),
+                "CPUExecutionProvider",
+            ]
 
         model_path = self.model_path
         if not model_path:
@@ -544,7 +582,7 @@ class OnnxEmbeddings(Embeddings):
             self.batch_size,
             self.cpu_mem_arena,
         )
-        self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name_or_path)
+        tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name_or_path)
         # With the arena enabled (ORT's default) freed activation blocks are cached and
         # never returned to the OS, so RSS ratchets up to the largest batch ever run and
         # holds that plateau for the life of the process. The reranker disables it for
@@ -553,23 +591,57 @@ class OnnxEmbeddings(Embeddings):
         if not self.cpu_mem_arena:
             session_options = ort.SessionOptions()
             session_options.enable_cpu_mem_arena = False
-        self._session = ort.InferenceSession(
-            model_path, sess_options=session_options, providers=["CPUExecutionProvider"]
-        )
+        try:
+            session = ort.InferenceSession(model_path, sess_options=session_options, providers=providers)
+        except Exception as exc:
+            if self.device != "cuda":
+                raise
+            raise RuntimeError(
+                f"ONNX CUDA session initialization failed for device {self.cuda_device_id}. "
+                "Check the model, CUDA/cuDNN libraries, driver, and visible device ID."
+            ) from exc
+        active_providers = session.get_providers()
+        if self.device == "cuda":
+            # A CUDA-capable wheel can still fail to load its libraries/device and ORT
+            # may return a CPU-only session without raising. Do not accept that session.
+            if "CUDAExecutionProvider" not in active_providers:
+                raise RuntimeError(
+                    "ONNX CUDA execution was requested, but the initialized session did not activate "
+                    f"CUDAExecutionProvider for device {self.cuda_device_id}. "
+                    "Check CUDA/cuDNN libraries, the driver, and GPU visibility. "
+                    f"Active providers: {active_providers}"
+                )
+            # Prevent run() from rebuilding the session on CPU after an EP failure.
+            # Normal graph partitioning (e.g. shape operations on CPU) stays enabled.
+            session.disable_fallback()
 
-        detected = len(self._encode_sync(["test"])[0])
-        if self.configured_dimensions is not None and detected != self.configured_dimensions:
-            raise ValueError(
-                f"Configured ONNX embedding dimension {self.configured_dimensions} does not match model output {detected}"
-            )
+        self._tokenizer = tokenizer
+        self._session = session
+        try:
+            detected = len(self._encode_sync(["test"])[0])
+            if self.configured_dimensions is not None and detected != self.configured_dimensions:
+                raise ValueError(
+                    f"Configured ONNX embedding dimension {self.configured_dimensions} does not match model output {detected}"
+                )
+        except Exception:
+            # A failed warm-up must not make the next initialize() look successful.
+            self._session = None
+            self._tokenizer = None
+            raise
         self._dimension = detected
-        logger.info("Embeddings: ONNX provider initialized (dim: %s)", self._dimension)
+        logger.info(
+            "Embeddings: ONNX provider initialized (dim: %s, device: %s, cuda_device_id: %s, providers: %s)",
+            self._dimension,
+            self.device,
+            self.cuda_device_id if self.device == "cuda" else None,
+            active_providers,
+        )
 
     async def encode(self, texts: list[str]) -> list[list[float]]:
         """Embed ``texts`` on a worker thread.
 
-        The model runs in-process and is CPU-bound, not I/O, so it goes to a thread to
-        keep the event loop free; asyncio.to_thread copies the caller's contextvars.
+        Tokenization and the synchronous ORT call run in-process, so a worker thread
+        keeps the event loop free on either device; to_thread copies contextvars.
         """
         return await asyncio.to_thread(self._encode_sync, texts)
 
@@ -873,6 +945,12 @@ class OpenAIEmbeddings(Embeddings):
         self.max_retries = max_retries
         self.query_prefix = query_prefix
         self.passage_prefix = passage_prefix
+        # OpenAI's own embedding models tokenize with cl100k_base, which counts slightly
+        # more tokens on English/markdown than the o200k_base default — enough that an
+        # input truncated to exactly 8192 still drew a 400 (#5234). Only for a model we
+        # recognize: the same class serves OpenAI-compatible servers with other models.
+        if model in self.MODEL_DIMENSIONS:
+            self.tokenizer_encoding = "cl100k_base"
         # One AsyncOpenAI per event loop: its pooled connections belong to the loop that
         # opened them, and initialize() is not guaranteed to run on the serving loop.
         self._clients: LoopLocal[Any] | None = None
@@ -1050,6 +1128,10 @@ class CohereEmbeddings(Embeddings):
     Supports embed-english-v3.0 (1024 dims) and embed-multilingual-v3.0 (1024 dims).
 
     The embedding dimension is auto-detected from the model at initialization.
+
+    Cohere's v3 models take the retrieval task as a request parameter (``input_type``),
+    so like ZeroEntropy this provider overrides encode_query()/encode_documents()
+    rather than prefixing text, and keeps encode() on the explicitly configured type.
     """
 
     # Known dimensions for Cohere embedding models
@@ -1083,8 +1165,9 @@ class CohereEmbeddings(Embeddings):
             output_dimensions: Optional output embedding dimensions (for Matryoshka-capable models)
             batch_size: Maximum batch size for embedding requests (default: 96, Cohere's limit)
             timeout: Request timeout in seconds (default: 60.0)
-            input_type: Input type for embeddings (default: search_document).
-                       Options: search_document, search_query, classification, clustering
+            input_type: Input type for direct encode() calls (default: search_document).
+                       Options: search_document, search_query, classification, clustering.
+                       Retrieval helpers select search_query/search_document per request.
             retry_policy: Bounded retry policy for transient upstream failures
                 (default: RetryPolicy() built-in defaults)
         """
@@ -1156,11 +1239,29 @@ class CohereEmbeddings(Embeddings):
         logger.info(f"Embeddings: Cohere provider initialized (model: {self.model}, dim: {self._dimension})")
 
     async def encode(self, texts: list[str]) -> list[list[float]]:
+        """Generate embeddings with the explicitly configured input type."""
+        return await self._encode_with_input_type(texts, self.input_type)
+
+    async def encode_query(self, texts: list[str]) -> list[list[float]]:
+        """Use Cohere's query-side task for recall without changing shared client state."""
+        return await self._encode_with_input_type(texts, "search_query")
+
+    async def encode_documents(self, texts: list[str]) -> list[list[float]]:
+        """Use Cohere's document-side task for retained text."""
+        return await self._encode_with_input_type(texts, "search_document")
+
+    async def _encode_with_input_type(self, texts: list[str], input_type: str) -> list[list[float]]:
         """
         Generate embeddings using the Cohere API.
 
+        The task travels with the request instead of being read off ``self.input_type``:
+        recall and retain run concurrently against one provider instance, so swapping a
+        shared attribute per call would let a retain batch embed as a query, or worse.
+
         Args:
             texts: List of text strings to encode
+            input_type: Cohere retrieval task for this request (search_query,
+                search_document, classification, clustering)
 
         Returns:
             List of embedding vectors
@@ -1176,9 +1277,9 @@ class CohereEmbeddings(Embeddings):
         # batches too.
         budget = self.retry_policy.new_budget()
 
-        return await self._encode_batched(texts, lambda batch: self._embed_batch(batch, budget))
+        return await self._encode_batched(texts, lambda batch: self._embed_batch(batch, input_type, budget))
 
-    async def _embed_batch(self, batch: list[str], budget: "RetryBudget") -> list[list[float]]:
+    async def _embed_batch(self, batch: list[str], input_type: str, budget: "RetryBudget") -> list[list[float]]:
         """Embed one batch-sized slice."""
         assert self._clients is not None
         client = self._clients.get()
@@ -1190,7 +1291,7 @@ class CohereEmbeddings(Embeddings):
                 lambda: client.v2.embed(
                     texts=batch,
                     model=self.model,
-                    input_type=self.input_type,
+                    input_type=input_type,
                     output_dimension=self.output_dimensions,
                     embedding_types=["float"],
                 ),
@@ -1203,7 +1304,7 @@ class CohereEmbeddings(Embeddings):
             lambda: client.embed(
                 texts=batch,
                 model=self.model,
-                input_type=self.input_type,
+                input_type=input_type,
             ),
             policy=self.retry_policy,
             budget=budget,
@@ -2065,7 +2166,7 @@ class GeminiEmbeddings(Embeddings):
         return [emb.values for emb in embeddings]
 
 
-def _retry_policy_from_config(config: "HindsightConfig") -> RetryPolicy:
+def _retry_policy_from_config(config: "ConfigLike") -> RetryPolicy:
     """Build the embedding retry policy from resolved configuration."""
     return RetryPolicy(
         max_retries=config.embeddings_max_retries,
@@ -2075,7 +2176,7 @@ def _retry_policy_from_config(config: "HindsightConfig") -> RetryPolicy:
     )
 
 
-def _with_request_concurrency(backend: Embeddings, config: "HindsightConfig") -> Embeddings:
+def _with_request_concurrency(backend: Embeddings, config: "ConfigLike") -> Embeddings:
     """Let a remote backend keep several requests in flight for one encode() call.
 
     Set here rather than in eight constructor signatures: the bound is a property of the
@@ -2148,6 +2249,8 @@ def create_embeddings_from_env() -> Embeddings:
             output_name=config.embeddings_onnx_output_name,
             batch_size=config.embeddings_onnx_batch_size,
             cpu_mem_arena=config.embeddings_onnx_cpu_mem_arena,
+            device=config.embeddings_onnx_device,
+            cuda_device_id=config.embeddings_onnx_cuda_device_id,
         )
     elif provider == "openai":
         # Use dedicated embeddings API key, or fall back to LLM API key

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from typing import Any
+
 import pytest
 
 from hindsight_api.engine.reflect.delta_ops import (
@@ -246,15 +249,45 @@ def test_parse_delta_operation_list_top_level_array_all_invalid_raises():
 
 
 class _ScriptedLLM:
-    """An LLM that returns canned replies in order and records what it was sent."""
+    """An LLM that returns canned replies in order and records what it was sent.
 
-    def __init__(self, *replies: str) -> None:
+    ``replies`` is typed ``Any`` because a provider does not always hand back
+    text: when the call set a ``response_format`` the OpenAI-compatible providers
+    parse the body and return the object — a dict under ``skip_validation``, the
+    validated model otherwise. The delta call site passes ``skip_validation=True``
+    (see ``memory_engine``), so a dict is what a real reply looks like here, and
+    every double in this file that returned text is what hid #4965.
+    """
+
+    def __init__(self, *replies: Any) -> None:
         self._replies = list(replies)
         self.calls: list[list[dict]] = []
 
     async def call(self, *, messages, scope, **kwargs):
         self.calls.append(messages)
         return LLMCallResult(content=self._replies[len(self.calls) - 1])
+
+
+class _RequestBodyRefused(Exception):
+    """What a provider returns when the request body fails its own type check (HTTP 422)."""
+
+
+class _StrictBodyLLM(_ScriptedLLM):
+    """A provider that type-checks the request body, the way DeepSeek does.
+
+    ``messages[N].content`` is typed as a string or a list of content blocks, so a
+    replayed parsed object is refused outright. That refusal is unrecoverable
+    here: it is the *second* call, so the caller's own retry ladder only repeats
+    it (#4965).
+    """
+
+    async def call(self, *, messages, scope, **kwargs):
+        for index, message in enumerate(messages):
+            if not isinstance(message.get("content"), (str, list)):
+                raise _RequestBodyRefused(
+                    f"messages[{index}]: content should be a string or a list",
+                )
+        return await super().call(messages=messages, scope=scope, **kwargs)
 
 
 _GOOD = '{"operations": [{"op": "append_block", "section_id": "s", "text": "ok"}]}'
@@ -330,3 +363,117 @@ async def test_request_delta_operations_leaves_unreachable_ops_alone_without_a_d
     llm = _ScriptedLLM(_UNKNOWN_SECTION)
     await request_delta_operations(llm, system_prompt="sys", user_prompt="usr", scope="test")
     assert len(llm.calls) == 1
+
+
+_DOC_TWO_BLOCKS = StructuredDocument(
+    sections=[
+        Section(
+            id="prefs",
+            heading="Preferences",
+            blocks=[Block(id="b1a2b3c4d", text="Uses tabs."), Block(id="b9f8e7d6c", text="Likes Go.")],
+        )
+    ]
+)
+_ONE_TYPO = (
+    '{"operations": ['
+    '{"op": "append_block", "section_id": "prefs", "text": "new"},'
+    '{"op": "replace_block", "section_id": "prefs", "block_id": "b1a2b3c4", "text": "Uses spaces."}]}'
+)
+_TYPO_FIXED = (
+    '{"operations": ['
+    '{"op": "append_block", "section_id": "prefs", "text": "new"},'
+    '{"op": "replace_block", "section_id": "prefs", "block_id": "b1a2b3c4d", "text": "Uses spaces."}]}'
+)
+
+
+async def test_request_delta_operations_asks_again_when_one_block_id_is_mistyped():
+    """#4829: one mistyped block id among good ops used to be dropped silently, keeping
+    the stale block under a clean refresh. It now gets the one retry, which quotes the
+    bad id and lists the section's real block ids."""
+    llm = _ScriptedLLM(_ONE_TYPO, _TYPO_FIXED)
+    op_list = await request_delta_operations(
+        llm, system_prompt="sys", user_prompt="usr", scope="test", document=_DOC_TWO_BLOCKS
+    )
+    assert len(llm.calls) == 2
+    correction = llm.calls[1][3]["content"]
+    assert "unknown block_id: b1a2b3c4" in correction
+    assert "- b1a2b3c4d: 'Uses tabs.'" in correction
+    outcome = apply_operations(_DOC_TWO_BLOCKS, op_list.operations)
+    assert not outcome.skipped
+    assert outcome.document.section_by_id("prefs").blocks[0].text == "Uses spaces."
+
+
+async def test_request_delta_operations_keeps_a_partial_reply_when_the_retry_still_misses():
+    """Still one retry only: a second miss goes back to the caller, which applies what lands."""
+    llm = _ScriptedLLM(_ONE_TYPO, _ONE_TYPO)
+    op_list = await request_delta_operations(
+        llm, system_prompt="sys", user_prompt="usr", scope="test", document=_DOC_TWO_BLOCKS
+    )
+    assert len(llm.calls) == 2
+    assert len(op_list.operations) == 2
+
+
+async def test_request_delta_operations_does_not_retry_an_op_skipped_for_its_content():
+    """Only a wrong id is worth a second call: an empty block would be skipped again."""
+    empty_text = (
+        '{"operations": ['
+        '{"op": "append_block", "section_id": "prefs", "text": "new"},'
+        '{"op": "replace_block", "section_id": "prefs", "block_id": "b1a2b3c4d", "text": "  "}]}'
+    )
+    llm = _ScriptedLLM(empty_text)
+    await request_delta_operations(llm, system_prompt="sys", user_prompt="usr", scope="test", document=_DOC_TWO_BLOCKS)
+    assert len(llm.calls) == 1
+
+
+# The retry, against a reply that arrives parsed (#4965) ------------------------
+
+# The same two replies the string-based tests above use, as the provider hands
+# them over: the first refused, the second repaired.
+_REFUSED_PARSED = json.loads(_STRAY)
+_REPAIRED_PARSED = json.loads(_GOOD)
+
+
+async def test_request_delta_operations_replays_a_parsed_reply_as_text():
+    """A provider hands the retry a parsed reply, not the text the model wrote, so
+    replaying it verbatim put a dict into a field every strict body validator types
+    as a string (#4965). It has to be quoted back as text — and as the same JSON,
+    so the model still reads the document it wrote."""
+    llm = _ScriptedLLM(_REFUSED_PARSED, _REPAIRED_PARSED)
+    await request_delta_operations(llm, system_prompt="sys", user_prompt="usr", scope="test")
+
+    assert len(llm.calls) == 2
+    replayed = llm.calls[1][2]
+    assert replayed["role"] == "assistant"
+    assert isinstance(replayed["content"], str)
+    # JSON rather than a repr: ``str(dict)`` also clears the body check, but
+    # quotes a different document from the one the model sent.
+    assert json.loads(replayed["content"]) == _REFUSED_PARSED
+
+
+async def test_request_delta_operations_delivers_the_retry_to_a_strict_provider():
+    """The refusal the retry exists to answer must not cost the retry itself.
+
+    DeepSeek type-checks the body and 422s a replayed object; the caller's retry
+    ladder then re-sends that identical body four times and the delta is dropped
+    under a refresh that reports success (#4965).
+    """
+    llm = _StrictBodyLLM(_REFUSED_PARSED, _REPAIRED_PARSED)
+    op_list = await request_delta_operations(llm, system_prompt="sys", user_prompt="usr", scope="test")
+
+    assert len(llm.calls) == 2
+    assert op_list.operations[0].section_id == "s"
+
+
+async def test_request_delta_operations_replays_a_validated_reply_as_text():
+    """The same hazard one type further along: a call that validates its
+    ``response_format`` gets the parsed model back rather than a dict. It reaches the
+    retry through the reference path too (#4206) — a well-formed op can still name a
+    section the document does not have."""
+    llm = _StrictBodyLLM(
+        DeltaOperationList(operations=[AppendBlockOp(section_id="gone", text="ok")]),
+        _KNOWN_SECTION,
+    )
+    op_list = await request_delta_operations(llm, system_prompt="sys", user_prompt="usr", scope="test", document=_DOC)
+
+    assert len(llm.calls) == 2
+    assert op_list.operations[0].section_id == "prefs"

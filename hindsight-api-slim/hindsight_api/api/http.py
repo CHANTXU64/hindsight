@@ -6,8 +6,6 @@ the FastAPI application with all API endpoints.
 """
 
 import asyncio
-import base64
-import binascii
 import json
 import logging
 import os
@@ -15,15 +13,15 @@ import re
 import time
 import traceback
 import uuid
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from urllib.parse import quote, unquote
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from hindsight_api.api import page_markdown
 from hindsight_api.api.admission import AdmissionAbandoned, AdmissionRejected, build_controller_from_config
@@ -64,7 +62,7 @@ if TYPE_CHECKING:
     from opentelemetry.trace import Span
 
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator, model_validator
 
 from hindsight_api import MemoryEngine
 from hindsight_api.config import RETAIN_EXTRACTION_MODES
@@ -212,11 +210,12 @@ def FieldWithDefault(default_factory: Callable, **kwargs) -> Any:
     return Field(default_factory=default_factory, json_schema_extra=json_extra, **kwargs)
 
 
-from hindsight_api.config import HindsightConfig, StaticConfigProxy, get_config
+from hindsight_api.config import ConfigLike, HindsightConfig, StaticConfigProxy, get_config
 from hindsight_api.engine.interface import BankTemplateImportWrite
 from hindsight_api.engine.memory_engine import (
     KEEP_PARENT,
     Budget,
+    KnowledgeTagFilter,
     RetainOperationConflictError,
     VisionNotSupportedError,
     _current_schema,
@@ -240,22 +239,49 @@ from hindsight_api.engine.response_models import (
 )
 from hindsight_api.engine.retain.attachment_content import (
     CanonicalContent,
-    RetainAttachment,
-    RetainText,
-    canonicalize,
-    compute_attachment_hash,
+    Content,
+    ContentValidationError,
+    TextContentBlock,
     contains_placeholder_like,
     iter_placeholder_ids,
-    neutralize_placeholders,
     short_attachment_id,
+    validate_and_canonicalize_content,
 )
-from hindsight_api.engine.retain.attachment_content import ContentBlock as CanonicalBlock
 from hindsight_api.engine.retain.attachment_store import StoredAttachment
 from hindsight_api.engine.search.tag_resolution import needs_resolution
 from hindsight_api.engine.search.tags import TagGroup, TagsMatch
+
+_TAG_GROUPS_ADAPTER: TypeAdapter[list[TagGroup]] = TypeAdapter(list[TagGroup])
+
+_TAG_GROUPS_QUERY_DESCRIPTION = (
+    "Compound tag filter as a JSON-encoded list of tag groups — the same shape `tag_groups` takes in a "
+    "recall body (leaves {tags, match, resolve} and {and: [...]}, {or: [...]}, {not: ...}; groups are "
+    "AND-ed). Mutually exclusive with `tags`."
+)
+
+
+def _parse_tag_groups_query(raw: str | None, tags: list[str] | None) -> list[TagGroup] | None:
+    """Parse a ``tag_groups`` query parameter.
+
+    A GET cannot carry a body, so the tree that recall takes as JSON arrives as a
+    JSON-encoded string. Invalid JSON or an invalid tree is a 400, and so is sending it
+    alongside ``tags`` — the same rule recall enforces on its body.
+    """
+    if raw is None:
+        return None
+    if tags:
+        raise HTTPException(
+            status_code=400,
+            detail="'tags' and 'tag_groups' are mutually exclusive. Use 'tag_groups' for compound filtering.",
+        )
+    try:
+        return _TAG_GROUPS_ADAPTER.validate_json(raw)
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid tag_groups: {e.errors(include_url=False)}")
+
+
 from hindsight_api.engine.structured_output import validate_response_schema
 from hindsight_api.engine.time_filter import DocumentTimeField, MemoryTimeField
-from hindsight_api.engine.token_encoding import count_tokens
 from hindsight_api.extensions import HttpExtension, OperationValidationError, load_extension
 from hindsight_api.liveness import LivenessResponse, liveness_response
 from hindsight_api.metrics import (
@@ -373,6 +399,55 @@ async def run_cancellable_on_disconnect(
     except OperationCancelledError as e:
         logger.info(f"[{operation.upper()} CANCELLED] bank={bank_id} reason={e.reason}")
         raise HTTPException(status_code=_CLIENT_CLOSED_REQUEST_STATUS_CODE, detail=e.reason) from e
+
+
+async def run_task_cancellable_on_disconnect(
+    http_request: Request,
+    coro: Awaitable[_T],
+    *,
+    operation: str,
+    bank_id: str,
+) -> _T:
+    """Run a coroutine as a task and cancel it outright if the client disconnects.
+
+    The cooperative variant above is the right shape for recall and reflect, whose
+    expensive stages run in worker threads that task cancellation cannot interrupt.
+    A synchronous retain is the opposite shape: almost all of its wall time is spent
+    *awaiting* — queued on the LLM concurrency semaphore, then on the provider's
+    response — so a checkpoint between stages never gets a turn, and only real task
+    cancellation unblocks it. An abandoned sync retain measured 1880s, holding an LLM
+    slot the whole way and committing into a bank that had been deleted meanwhile
+    (issue #4526).
+
+    Cancelling retain mid-flight is a path the pipeline already handles: the worker
+    runs every retain under an absolute ``asyncio.timeout`` ceiling, and the
+    orchestrator's ``finally`` blocks commit what earlier sub-batches produced and
+    stop the in-flight extraction tasks.
+    """
+    token = get_scope_cancellation_token(http_request.scope)
+    if token is None:
+        return await coro
+    task = asyncio.ensure_future(coro)
+    waiter = asyncio.ensure_future(token.wait())
+    try:
+        done, _ = await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            return task.result()
+        task.cancel()
+        # Awaited, not abandoned: the unwinding task still commits partial work and
+        # tears down its own subtasks, and anything it raises on the way out is the
+        # cancellation, not a fault worth reporting over the 499.
+        await asyncio.gather(task, return_exceptions=True)
+        logger.info(f"[{operation.upper()} CANCELLED] bank={bank_id} reason={token.reason}")
+        raise HTTPException(status_code=_CLIENT_CLOSED_REQUEST_STATUS_CODE, detail=token.reason)
+    finally:
+        waiter.cancel()
+        # This call can itself be cancelled from above (server shutdown, a deadline),
+        # and `asyncio.wait` does not propagate that to what it was waiting on —
+        # leaving the retain running with nobody to answer, the very thing this
+        # helper exists to stop. Already done on the disconnect path above.
+        if not task.done():
+            task.cancel()
 
 
 class EntityIncludeOptions(BaseModel):
@@ -566,7 +641,8 @@ class RecallResult(BaseModel):
         description=(
             "Attachments this fact was drawn from, as recorded per fact at extraction time — the "
             "same edge the memory read endpoints return, not everything its chunk happened to "
-            "carry. A fact stated in prose reports none. Omitted when there are none."
+            "carry. A fact stated in prose reports none; an observation reports those of the facts "
+            "it was consolidated from. Omitted when there are none."
         ),
     )
 
@@ -837,92 +913,9 @@ class EntityInput(BaseModel):
     type: str | None = Field(default=None, description="Optional entity type (e.g., 'PERSON', 'ORG', 'CONCEPT')")
 
 
-#: A syntactically well-formed MIME type. Deliberately the ONLY constraint on what
-#: may be attached: vision models keep gaining formats (PDF, audio, video), and an
-#: allowlist here would refuse content the provider would happily have read. An
-#: unsupported type is rejected by the provider, and that rejection fails the
-#: retain with the provider's own message — see `_require_vision_capable_retain_llm`.
-_MEDIA_TYPE_RE = re.compile(r"^[\w.+-]+/[\w.+-]+$")
-
 #: Image types the recall/UI path renders inline. Everything else is still stored
 #: and still sent to the model; this only decides what a browser is asked to draw.
 RENDERABLE_IMAGE_MEDIA_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
-
-
-class Base64AttachmentSource(BaseModel):
-    """Inline attachment bytes, base64-encoded.
-
-    The only source type in this version. ``url`` (server-side fetch) and
-    ``blob_id`` (pre-uploaded handle) are the natural next ones, which is why this
-    is modelled as a discriminated union on ``type`` rather than as bare fields.
-    """
-
-    type: Literal["base64"] = "base64"
-    media_type: str = Field(
-        description=(
-            "MIME type of the attachment, e.g. 'image/png' or 'application/pdf'. Any well-formed "
-            "type is accepted; whether the model can read it is the model's answer to give, and a "
-            "provider that rejects it fails the retain with its own error."
-        )
-    )
-    data: str = Field(description="Base64-encoded bytes (no data: URI prefix).")
-
-    @field_validator("media_type")
-    @classmethod
-    def validate_media_type(cls, v: str) -> str:
-        if not _MEDIA_TYPE_RE.match(v):
-            raise ValueError(f"media_type must look like 'type/subtype', got {v!r}")
-        return v
-
-    def decode(self) -> bytes:
-        """Decode the payload, raising ``ValueError`` on malformed base64.
-
-        Not a validator: decoding a large attachment is expensive enough that it
-        should happen once, at the point the bytes are actually needed, rather
-        than on every model construction. The retain handler calls this inside its
-        request-validation block so a bad payload is still a 400, not a 500.
-        """
-        try:
-            return base64.b64decode(self.data, validate=True)
-        except (binascii.Error, ValueError) as e:
-            raise ValueError(f"attachment source data is not valid base64: {e}") from e
-
-
-class TextContentBlock(BaseModel):
-    """A run of text within a multimodal item, in the position the caller wrote it."""
-
-    type: Literal["text"]
-    text: str
-
-
-class ImageContentBlock(BaseModel):
-    """An image within a multimodal item, in the position the caller wrote it."""
-
-    type: Literal["image"]
-    source: Base64AttachmentSource
-
-
-class FileContentBlock(BaseModel):
-    """A non-image attachment — a PDF, a spreadsheet — in the position it was written.
-
-    Split from ``image`` rather than folded into one type because the providers
-    split it: Anthropic has distinct image and document blocks, OpenAI has
-    image_url and file parts. Carrying the caller's own distinction through means
-    the per-provider conversion never has to guess from the media type alone.
-    """
-
-    type: Literal["file"]
-    source: Base64AttachmentSource
-    filename: str | None = Field(
-        default=None,
-        description="Original filename, passed to providers that show one to the model (e.g. OpenAI).",
-    )
-
-
-#: One element of a multimodal ``content`` array. Discriminated on ``type`` so a
-#: malformed block reports which variant it failed against instead of dumping
-#: every variant's errors.
-ContentBlock = Annotated[TextContentBlock | ImageContentBlock | FileContentBlock, Field(discriminator="type")]
 
 
 def bank_attachment_url(bank_id: str, attachment_id: str) -> str:
@@ -998,6 +991,7 @@ async def _attach_to_memories(
     It is per fact, not per chunk: a chunk carrying a screenshot also carries the
     prose around it, and showing the screenshot against every fact from that one
     LLM call attributes the diagram to the paragraph that never mentioned it.
+    An observation shows the attachments of the facts it was consolidated from.
 
     One lookup for the whole page, not one per memory.
 
@@ -1008,6 +1002,7 @@ async def _attach_to_memories(
     back from a table the store never wrote.
     """
     unit_ids: list[str] = []
+    observation_ids: list[str] = []
     carried: dict[str, tuple[str | None, list[str]]] = {}
     for item in items:
         if not isinstance(item, dict):
@@ -1016,11 +1011,16 @@ async def _attach_to_memories(
         if not item.get("id"):
             continue
         unit_ids.append(item["id"])
+        # The list view names the type `fact_type`, the detail view `type`.
+        if (item.get("fact_type") or item.get("type")) == "observation":
+            observation_ids.append(str(item["id"]))
         if ids is not None:
             carried[str(item["id"])] = (item.get("document_id"), list(ids))
     if not unit_ids:
         return
-    by_unit = await memory_app.attachments_for_memories(bank_id, unit_ids, request_context, carried=carried)
+    by_unit = await memory_app.attachments_for_memories(
+        bank_id, unit_ids, request_context, carried=carried, observation_ids=observation_ids
+    )
     if not by_unit:
         return
     for item in items:
@@ -1032,11 +1032,11 @@ async def _attach_to_memories(
 async def _attach_to_recall_results(
     memory_app: "MemoryEngine",
     bank_id: str,
-    results: "list[RecallResult]",
+    results: "Sequence[RecallResult | ReflectFact]",
     request_context: RequestContext,
     carried: "dict[str, tuple[str | None, list[str]]] | None" = None,
 ) -> None:
-    """Add ``attachments`` to recall results — the same per-fact edge as :func:`_attach_to_memories`.
+    """Add ``attachments`` to recall results and reflect evidence — the per-fact edge of :func:`_attach_to_memories`.
 
     Recall already reports the chunk each fact came from, and a chunk lists every
     attachment its text references; that is strictly coarser. A chunk holding a
@@ -1055,7 +1055,13 @@ async def _attach_to_recall_results(
     unit_ids = [result.id for result in results if result.id]
     if not unit_ids:
         return
-    by_unit = await memory_app.attachments_for_memories(bank_id, unit_ids, request_context, carried=carried)
+    by_unit = await memory_app.attachments_for_memories(
+        bank_id,
+        unit_ids,
+        request_context,
+        carried=carried,
+        observation_ids=[result.id for result in results if result.id and result.type == "observation"],
+    )
     if not by_unit:
         return
     for result in results:
@@ -1065,10 +1071,10 @@ async def _attach_to_recall_results(
 
 
 def canonicalize_item_content(
-    content: str | list[ContentBlock],
+    content: Content,
     *,
     item_index: int,
-    config: HindsightConfig,
+    config: ConfigLike,
     allowed_attachment_ids: "set[str] | None" = None,
 ) -> CanonicalContent:
     """Flatten a retain item's content to the canonical text the pipeline stores.
@@ -1084,59 +1090,18 @@ def canonicalize_item_content(
     here — any well-formed media type is accepted and the provider's rejection is
     what fails the retain.
     """
-    if isinstance(content, str):
-        # Scrubbed exactly like a text block. Only the canonicalizer may mint a
-        # placeholder: without this, a caller could hand-write the token in plain
-        # string content and have extraction resolve it to an attachment the
-        # document never carried — anything already retained in the same bank.
-        return CanonicalContent(text=neutralize_placeholders(content, allowed_attachment_ids), attachments=())
-
-    blocks: list[CanonicalBlock] = []
-    attachment_count = 0
-    for block_index, block in enumerate(content):
-        if isinstance(block, TextContentBlock):
-            blocks.append(RetainText(block.text))
-            continue
-
-        attachment_count += 1
-        if attachment_count > config.retain_attachment_max_count:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"items[{item_index}] carries more than {config.retain_attachment_max_count} attachments. "
-                    f"Split the content across several items."
-                ),
-            )
-        try:
-            data = block.source.decode()
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"items[{item_index}].content[{block_index}]: {e}") from e
-        if not data:
-            raise HTTPException(
-                status_code=400,
-                detail=f"items[{item_index}].content[{block_index}]: attachment source data is empty",
-            )
-        if len(data) > config.retain_attachment_max_size_bytes:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"items[{item_index}].content[{block_index}]: attachment is "
-                    f"{len(data) / (1024 * 1024):.1f}MB, exceeding the "
-                    f"{config.retain_attachment_max_size_mb}MB limit for a single attachment."
-                ),
-            )
-        blocks.append(
-            RetainAttachment(
-                attachment_hash=compute_attachment_hash(data),
-                media_type=block.source.media_type,
-                data=data,
-                block_index=block_index,
-                kind=block.type,
-                filename=getattr(block, "filename", None),
-            )
+    try:
+        return validate_and_canonicalize_content(
+            content,
+            max_attachment_count=config.retain_attachment_max_count,
+            max_attachment_size_bytes=config.retain_attachment_max_size_bytes,
+            max_attachment_size_mb=config.retain_attachment_max_size_mb,
+            allowed_attachment_ids=allowed_attachment_ids,
+            path_prefix=f"items[{item_index}].content",
+            attachment_limit_path=f"items[{item_index}]",
         )
-
-    return canonicalize(blocks, allowed_attachment_ids)
+    except ContentValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 class MemoryItem(BaseModel):
@@ -1156,7 +1121,7 @@ class MemoryItem(BaseModel):
         },
     )
 
-    content: str | list[ContentBlock] = Field(
+    content: Content = Field(
         description=(
             "The raw content to retain. Either a plain string, or an ordered list of "
             "content blocks so images sit inline where they actually appear:\n\n"
@@ -1182,7 +1147,9 @@ class MemoryItem(BaseModel):
     document_id: str | None = Field(
         default=None,
         description="Optional document ID for this memory item. Provide a distinct document_id per source "
-        "document — items sharing a document_id are grouped into the same document. Auto-generated when omitted.",
+        "document — items sharing a document_id are grouped into the same document. Auto-generated when omitted: "
+        "if no item in the request has one, they all share one generated document (a request split into "
+        "parts for size gets one per part); otherwise each item without one gets its own.",
     )
     entities: list[EntityInput] | None = Field(
         default=None,
@@ -1203,24 +1170,6 @@ class MemoryItem(BaseModel):
         default=None,
         description="Optional tags for visibility scoping. Memories with tags can be filtered during recall.",
     )
-
-    @field_validator("content")
-    @classmethod
-    def validate_content(cls, v: str | list[ContentBlock]) -> str | list[ContentBlock]:
-        if isinstance(v, str):
-            if not v.strip():
-                raise ValueError("content cannot be empty")
-            return v
-
-        if not v:
-            raise ValueError("content cannot be empty")
-        # An all-text block list must clear the same bar as the string form. A list
-        # carrying an attachment is never empty, whatever its text blocks say.
-        if not any(isinstance(block, (ImageContentBlock, FileContentBlock)) for block in v) and not any(
-            block.text.strip() for block in v if isinstance(block, TextContentBlock)
-        ):
-            raise ValueError("content cannot be empty")
-        return v
 
     @field_validator("tags", mode="before")
     @classmethod
@@ -1494,9 +1443,12 @@ class ReflectDefaultOptions(BaseModel):
 
     Every field is ``None`` = "not set", so the same model is both the shape of
     the ``reflect_default_options`` bank config key and the set of fields a
-    reflect request (or a mental model's trigger) inherits from it. The
-    resolution chain is: explicit request/trigger value -> bank
-    ``reflect_default_options`` -> the shipped default.
+    reflect request inherits from it. The resolution chain is: explicit request
+    value -> bank ``reflect_default_options`` -> the shipped default.
+
+    A mental-model refresh does NOT read this. It is its own operation with its
+    own per-bank default (``knowledge_page_default_trigger``), so the same-named
+    fields are declared on ``MentalModelTrigger`` instead — see there.
     """
 
     reflect_search_observations_max_tokens: int | None = Field(
@@ -1652,6 +1604,18 @@ class ReflectFact(BaseModel):
     context: str | None = None
     occurred_start: str | None = None
     occurred_end: str | None = None
+    mentioned_at: str | None = None
+    document_id: str | None = None
+    chunk_id: str | None = None
+    tags: list[str] | None = None
+    metadata: dict[str, str] | None = None
+    attachments: list[ChunkAttachment] | None = Field(
+        default=None,
+        description=(
+            "Attachments this memory was drawn from — the same per-fact edge recall reports. "
+            "An observation reports those of the facts it was consolidated from. Omitted when there are none."
+        ),
+    )
 
 
 class ReflectDirective(BaseModel):
@@ -1800,6 +1764,64 @@ class BankProfileResponse(BaseModel):
     background: str | None = Field(default=None, description="Deprecated: use mission instead")
 
 
+class BankAliasEntry(BaseModel):
+    """One id a bank answers to."""
+
+    alias: str
+    primary: bool = Field(
+        default=False,
+        description=(
+            "Whether this alias is shown in place of the bank's own id. Display only — "
+            "the bank keeps its id, and everything that names a bank still uses it. At "
+            "most one alias per bank can be primary, and none has to be."
+        ),
+    )
+
+
+class BankAliasesResponse(BaseModel):
+    """Response model for a bank's aliases."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "bank_id": "user123",
+                "aliases": [
+                    {"alias": "user-123", "primary": True},
+                    {"alias": "legacy-user123", "primary": False},
+                ],
+            }
+        }
+    )
+
+    bank_id: str = Field(description="The bank's own id, which an alias never replaces")
+    aliases: list[BankAliasEntry] = Field(
+        description="Extra ids that also reach this bank, the primary one first then oldest first"
+    )
+
+
+class SetBankAliasPrimaryRequest(BaseModel):
+    """Request model for showing (or no longer showing) an alias in place of the bank id."""
+
+    primary: bool = Field(description="True to present the bank under this alias; False to go back to its own id.")
+
+
+class CreateBankAliasRequest(BaseModel):
+    """Request model for adding an alias to a bank."""
+
+    model_config = ConfigDict(json_schema_extra={"example": {"alias": "user-123"}})
+
+    alias: str = Field(
+        description=(
+            "The extra bank id. Same rules as a bank id (non-empty, at most 192 bytes of UTF-8, no "
+            "control characters), and it must not already name a bank or another alias."
+        )
+    )
+    primary: bool = Field(
+        default=False,
+        description="Also show the bank under this alias, replacing whichever alias is shown today.",
+    )
+
+
 class UpdateDispositionRequest(BaseModel):
     """Request model for updating disposition traits."""
 
@@ -1882,6 +1904,22 @@ class BankListItem(BaseModel):
         description=(
             "When anything was last written to this bank: a document retained (including "
             "appends to an existing document) or a fact stored. Null if the bank is empty."
+        ),
+    )
+    display_alias: str | None = Field(
+        default=None,
+        description=(
+            "The alias this bank is presented under, when one was promoted. Display only: "
+            "`bank_id` remains the bank's identity everywhere else. Null when no alias is primary, "
+            "in which case show `bank_id`."
+        ),
+    )
+    matched_aliases: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Aliases of this bank that matched the search `q`. Empty when no search was "
+            "made, or when the bank matched on its own id or name — so a non-empty value "
+            "explains a result whose `bank_id` does not contain the search text."
         ),
     )
 
@@ -2508,7 +2546,12 @@ class DryRunExtractRequest(BaseModel):
     without changing the bank. Unset (null) fields fall back to the bank's resolved config.
     """
 
-    content: str = Field(description="Text to extract facts from (e.g. a document or a single chunk).")
+    content: Content = Field(
+        description=(
+            "The raw content to extract facts from. Either a plain string, or an ordered list of "
+            "content blocks (text, image, file) so images/attachments sit inline where they actually appear."
+        )
+    )
     context: str = Field(default="", description="Optional context about the content.")
     # Named `timestamp` to match the retain item payload (retain maps timestamp -> event_date internally).
     timestamp: datetime | None = Field(
@@ -2543,13 +2586,6 @@ class DryRunExtractRequest(BaseModel):
     llm_output_language: str | None = None
 
     _migrate_entity_labels = field_validator("entity_labels", mode="before")(_migrate_entity_labels_input)
-
-    @field_validator("content")
-    @classmethod
-    def validate_content(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("content cannot be empty")
-        return v
 
 
 class DocumentListItem(OpenRowModel):
@@ -3129,13 +3165,27 @@ class UpdateDirectiveRequest(BaseModel):
 # =========================================================================
 
 
-class MentalModelTrigger(ReflectDefaultOptions):
+class MentalModelTrigger(BaseModel):
     """Trigger settings for a mental model.
 
-    Inherits the reflect options an operator can also default per bank
-    (``reflect_default_options``): set here they apply to this model's refreshes
-    only, and win over the bank default.
+    A refresh is not an ad-hoc reflect with different arguments: it synthesizes a
+    whole document, so it wants its own retrieval and iteration settings. This
+    trigger is therefore the only source for them — a bank's
+    ``reflect_default_options`` deliberately does not reach a refresh. The
+    per-bank default for these fields is ``knowledge_page_default_trigger``,
+    which is merged over this same shape when a page is created.
     """
+
+    budget: Budget | None = Field(
+        default=None,
+        description=(
+            "How many agent iterations a refresh may spend, as a multiple of "
+            "reflect_max_iterations: 'low' halves it, 'mid' keeps it, 'high' doubles it. "
+            "A refresh is the heaviest reflect there is — it writes a whole document, and with "
+            "exclude_mental_models it must read raw facts first — so null means 'mid', not the "
+            "'low' an ad-hoc reflect defaults to."
+        ),
+    )
 
     mode: Literal["full", "delta"] = Field(
         default="full",
@@ -3197,7 +3247,9 @@ class MentalModelTrigger(ReflectDefaultOptions):
             "one of the model's tags and untagged memories are excluded, which is why a model "
             "tagged with labels its memories do not carry refreshes to empty content. "
             "Set to 'all' to keep requiring the tags while including untagged memories, or to "
-            "'any' to include untagged memories alongside any single tag match."
+            "'any' to include untagged memories alongside any single tag match. "
+            "Staleness ignores that widening: an untagged write never marks a tagged model stale, "
+            "in any mode — only a write that matches the model's tags does."
         ),
     )
     tag_groups: list[TagGroup] | None = Field(
@@ -3227,6 +3279,23 @@ class MentalModelTrigger(ReflectDefaultOptions):
         description=(
             "Override the token budget for raw chunks returned by the internal recall during refresh. "
             "None means use the bank/global config default (recall_chunks_max_tokens)."
+        ),
+    )
+    reflect_search_observations_max_tokens: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Override the token budget for the refresh's search_observations calls. Observation "
+            "evidence is often the largest contributor to the reflect context; lowering it trades "
+            "the lowest-ranked observations for a smaller LLM context. null means the shipped 5000."
+        ),
+    )
+    reflect_search_observations_include_entities: bool | None = Field(
+        default=None,
+        description=(
+            "Override whether search_observations attaches resolved entity names to each "
+            "observation. Entities can be more than half the serialized tool payload; turning them "
+            "off keeps the same observations and ranking with a much smaller context. null means enabled."
         ),
     )
     response_schema: dict | None = Field(
@@ -3508,8 +3577,22 @@ class KnowledgePageResponse(BaseModel):
     description: str | None = Field(default=None, description="The source query that rebuilds the page.")
     tags: list[str] = FieldWithDefault(list)
     timestamp: str | None = Field(default=None, description="Last refresh time (falls back to creation).")
-    body: str | None = Field(default=None, description="The page's synthesized markdown body.")
-    markdown: str = Field(description="The full markdown document: YAML frontmatter + markdown body.")
+    body: str | None = Field(
+        default=None,
+        description=(
+            "The page's synthesized markdown body, exactly as stored. Empty until a refresh "
+            "writes one — unlike `markdown`, which says so in words. Build a UI's own empty "
+            "state off this field; read `markdown` to show the document itself."
+        ),
+    )
+    markdown: str = Field(
+        description=(
+            "The full markdown document: YAML frontmatter + markdown body. A page with no body "
+            "yet renders 'No content yet.' as its body rather than frontmatter alone, which reads "
+            "as a page that failed to render. The notice is added here on the way out; the stored "
+            "body in `body` stays empty, and the export bundle keeps the bare document."
+        )
+    )
 
 
 class KnowledgePageBundleFile(BaseModel):
@@ -3531,7 +3614,15 @@ class KnowledgePageSearchResult(BaseModel):
     id: str
     name: str
     mental_model_id: str | None = None
-    snippet: str
+    source_query: str | None = Field(default=None, description="The question the page answers.")
+    snippet: str = Field(
+        description=(
+            "The page's opening text. A page whose body is still empty says so in words — "
+            "'No content yet.' — rather than coming back blank, so a caller can tell an "
+            "unwritten page from a page whose snippet simply did not render. The marker is "
+            "produced on the way out; the stored body stays empty and out of the search index."
+        )
+    )
     score: float = Field(
         description=(
             "Rank-fusion score in 0..1, where 1.0 means every search arm placed this page first. "
@@ -3568,6 +3659,34 @@ def _knowledge_node_model(node: dict[str, Any]) -> KnowledgeNode:
     )
 
 
+def _knowledge_tag_filter(
+    tags: list[str] | None = Query(
+        None,
+        description="Only return pages carrying these tags (matched per `tags_match`, like recall).",
+    ),
+    tags_match: TagsMatch = Query(
+        "any",
+        description="How `tags` match a page's tags: any, all, any_strict, all_strict, exact. "
+        "'any'/'all' also return untagged pages; the _strict modes and 'exact' do not.",
+    ),
+    tag_groups: str | None = Query(
+        None,
+        description="JSON-encoded compound tag filter, same shape as recall's `tag_groups`, e.g. "
+        '`[{"or":[{"tags":["user:kate"],"match":"all_strict"},{"tags":["team"]}]}]`. '
+        "Top-level groups are AND-ed, and AND-ed with `tags`.",
+    ),
+) -> KnowledgeTagFilter:
+    """Query-string tag filter shared by the knowledge-base tree and search."""
+    try:
+        groups = _TAG_GROUPS_ADAPTER.validate_json(tag_groups) if tag_groups else None
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=f"Invalid tag_groups: {e}")
+    return KnowledgeTagFilter(tags=tags or None, tags_match=tags_match, tag_groups=groups)
+
+
+_TAG_GROUPS_ADAPTER: TypeAdapter[list[TagGroup]] = TypeAdapter(list[TagGroup])
+
+
 def _build_knowledge_tree(nodes: list[dict[str, Any]]) -> list[KnowledgeNode]:
     """Assemble the flat node list into a nested tree of roots."""
     models = {n["id"]: _knowledge_node_model(n) for n in nodes}
@@ -3593,7 +3712,7 @@ def _knowledge_page_response(node: dict[str, Any]) -> KnowledgePageResponse:
         tags=page.display_tags,
         timestamp=node.get("last_refreshed_at") or node.get("created_at"),
         body=node.get("content"),
-        markdown=page_markdown.render_document(node),
+        markdown=page_markdown.render_document(node, notice_when_empty=True),
     )
 
 
@@ -4151,7 +4270,7 @@ async def apply_bank_template_manifest(
             provisioned = await memory.list_mental_models(
                 bank_id=bank_id,
                 limit=None,
-                detail="metadata",
+                detail="config",
                 request_context=request_context,
             )
             existing_by_id = {item["id"]: item for item in provisioned.items}
@@ -4212,7 +4331,7 @@ async def apply_default_bank_template_resources(
     existing_by_id: dict[str, dict[str, Any]] = {}
     if manifest.mental_models:
         existing = await memory.list_mental_models(
-            bank_id=bank_id, limit=None, detail="metadata", request_context=request_context
+            bank_id=bank_id, limit=None, detail="config", request_context=request_context
         )
         existing_by_id = {model["id"]: model for model in existing.items}
 
@@ -4237,6 +4356,37 @@ async def apply_default_bank_template_resources(
     )
 
 
+def _mental_model_matches_template(stored: dict[str, Any], mm: "BankTemplateMentalModel") -> bool:
+    """True when re-applying ``mm`` would leave the stored model as it is.
+
+    Mirrors what the update writes: empty manifest tags leave the stored tags
+    alone, so they never count as a difference. The stored trigger goes through
+    ``MentalModelTrigger`` so its unset fields get the same defaults as the
+    manifest's; one that no longer parses counts as changed.
+    """
+    try:
+        stored_trigger = MentalModelTrigger.model_validate(stored["trigger"] or {})
+    except ValidationError:
+        return False
+    return (
+        stored["name"] == mm.name
+        and stored["source_query"] == mm.source_query
+        and stored["max_tokens"] == mm.max_tokens
+        and (not mm.tags or set(stored["tags"]) == set(mm.tags))
+        and stored_trigger == mm.trigger
+    )
+
+
+def _directive_matches_template(stored: dict[str, Any], directive: "BankTemplateDirective") -> bool:
+    """True when re-applying ``directive`` would leave the stored one as it is."""
+    return (
+        stored["content"] == directive.content
+        and stored["priority"] == directive.priority
+        and stored["is_active"] == directive.is_active
+        and (not directive.tags or set(stored["tags"]) == set(directive.tags))
+    )
+
+
 async def _apply_bank_template_resources(
     memory: MemoryEngine,
     bank_id: str,
@@ -4255,6 +4405,10 @@ async def _apply_bank_template_resources(
     if manifest.mental_models:
         for mm in manifest.mental_models:
             if mm.id in existing_mental_models:
+                # Unchanged: skip it, or every re-apply of the same manifest would
+                # regenerate the model with an LLM call for nothing (#5271).
+                if _mental_model_matches_template(existing_mental_models[mm.id], mm):
+                    continue
                 await memory.update_mental_model(
                     bank_id=bank_id,
                     mental_model_id=mm.id,
@@ -4277,7 +4431,7 @@ async def _apply_bank_template_resources(
                     bank_id=bank_id,
                     name=mm.name,
                     source_query=mm.source_query,
-                    content="Generating content...",
+                    content="",
                     mental_model_id=mm.id,
                     tags=mm.tags if mm.tags else None,
                     max_tokens=mm.max_tokens,
@@ -4298,6 +4452,8 @@ async def _apply_bank_template_resources(
     if manifest.directives:
         for directive in manifest.directives:
             if directive.name in existing_directives:
+                if _directive_matches_template(existing_directives[directive.name], directive):
+                    continue
                 await memory.update_directive(
                     bank_id=bank_id,
                     directive_id=existing_directives[directive.name]["id"],
@@ -4376,6 +4532,10 @@ class OperationResponse(BaseModel):
 
     id: str
     task_type: str
+    operation_id: str | None = Field(default=None, description="Same as `id`; the name the single-operation read uses.")
+    operation_type: str | None = Field(
+        default=None, description="Same as `task_type`; the name the single-operation read uses."
+    )
     items_count: int
     document_id: str | None = None
     filename: str | None = Field(
@@ -4387,8 +4547,7 @@ class OperationResponse(BaseModel):
         description=(
             "Mental model this operation acted on (refresh_mental_model); null for other task types. "
             "Without it the list cannot say which model an operation refreshed — `document_id` is null "
-            "for these, and the list carries no result_metadata. The single-operation read exposes the "
-            "same value under `result_metadata`."
+            "for these, and the list carries no result_metadata."
         ),
     )
     details: RefreshMentalModelOperationDetails | None = Field(
@@ -4566,6 +4725,14 @@ class OperationStatusResponse(BaseModel):
     operation_id: str
     status: Literal["pending", "processing", "completed", "failed", "cancelled", "not_found"]
     operation_type: str | None = None
+    id: str | None = Field(default=None, description="Same as `operation_id`; the name the operations list uses.")
+    task_type: str | None = Field(
+        default=None, description="Same as `operation_type`; the name the operations list uses."
+    )
+    mental_model_id: str | None = Field(
+        default=None,
+        description="Mental model this operation acted on (refresh_mental_model); null for other task types.",
+    )
     created_at: str | None = None
     updated_at: str | None = None
     completed_at: str | None = None
@@ -4989,7 +5156,9 @@ def create_app(
             # Convert default schema to None for SQL compatibility (no schema prefix)
             schema = None if config.database_schema == DEFAULT_DATABASE_SCHEMA else config.database_schema
             poller = WorkerPoller(
-                backend=memory._backend,
+                # Not `_backend` directly: it is Optional only because `close()` clears it, and
+                # this runs while the engine is live.
+                backend=memory._require_backend(),
                 worker_id=worker_id,
                 executor=memory.execute_task,
                 poll_interval_ms=config.worker_poll_interval_ms,
@@ -5281,7 +5450,38 @@ def _register_routes(app: FastAPI):
             else:
                 api_key = authorization.strip()
         extra_headers = collect_passthrough_headers(request.headers.raw, get_config().extension_passthrough_headers)
-        return RequestContext(api_key=api_key, extra_headers=extra_headers)
+        # One context per request, reused by every caller. The alias resolution on
+        # the route class builds one before FastAPI solves the endpoint's
+        # dependencies, and `authenticated_schema` is memoised on the object — so
+        # sharing it is what keeps a request to one tenant authentication.
+        cached = getattr(request.state, "hs_request_context", None)
+        if cached is not None:
+            return cached
+        context = RequestContext(api_key=api_key, extra_headers=extra_headers)
+        request.state.hs_request_context = context
+        return context
+
+    async def _resolve_bank_alias(request: Request, bank_id: str) -> str:
+        """Turn an aliased bank id from the path into the bank's canonical id.
+
+        Installed on ``app.state`` for the route class to call (see
+        :mod:`hindsight_api.api.unknown_params`), which is the one place every bank
+        endpoint passes through. It lives here, not there, because it needs this
+        app's engine and this request's tenant: aliases are per-schema, and the
+        schema comes from authenticating the caller.
+
+        Authentication is not extra work, only earlier work -- the endpoint's own
+        engine call authenticates too, and both reach the same cached contextvar.
+        """
+        # The engine authenticates the tenant and does the lookup: aliases are
+        # per-schema, and the schema comes from the caller's identity. This layer
+        # only supplies the request context, since API handlers do no data access.
+        return await app.state.memory.resolve_bank_alias(
+            bank_id,
+            request_context=get_request_context(request, request.headers.get("authorization")),
+        )
+
+    app.state.resolve_bank_alias = _resolve_bank_alias
 
     def admit_for(operation: PrecheckOperation):
         """Build a FastAPI dependency that holds an admission permit for the request.
@@ -5301,9 +5501,11 @@ def _register_routes(app: FastAPI):
             if controller is None:
                 yield
                 return
-            # Recall and reflect carry a disconnect token (see api/disconnect.py). A
-            # queued request whose client has gone gives up its place immediately,
-            # which is what makes a patient deadline affordable.
+            # Recall, reflect and the retain POST carry a disconnect token (see
+            # api/disconnect.py). A queued request whose client has gone gives up its
+            # place immediately, which is what makes a patient deadline affordable.
+            # Retain joined them in #4526: before that its lane kept the place of a
+            # caller that had already hung up, because this returned None for it.
             abandoned = get_scope_cancellation_token(request.scope)
             try:
                 async with controller.admit(str(operation), abandoned=abandoned):
@@ -5720,6 +5922,7 @@ def _register_routes(app: FastAPI):
             # downstream sees the same shape it gets from the bank's stored config.
             if "entity_labels" in overrides:
                 overrides["entity_labels"] = [lg.model_dump() for lg in overrides["entity_labels"]]
+
             return await app.state.memory.extract_dry_run(
                 bank_id,
                 body.content,
@@ -5734,6 +5937,8 @@ def _register_routes(app: FastAPI):
             raise HTTPException(status_code=400, detail=str(e))
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except VisionNotSupportedError as e:
+            raise HTTPException(status_code=422, detail=str(e))
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -5968,16 +6173,6 @@ def _register_routes(app: FastAPI):
                 metrics.record_recall_phase("deps_total", max(0.0, _deps_done - _deps_t0))
             if _deps_done:
                 metrics.record_recall_phase("body_parse", max(0.0, handler_start - _deps_done))
-
-        # Validate query length to prevent expensive operations on oversized queries
-        max_query_tokens = get_config().recall_max_query_tokens
-        if max_query_tokens > 0:  # 0 (or negative) disables the cap
-            query_tokens = count_tokens(request.query)
-            if query_tokens > max_query_tokens:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Query too long: {query_tokens} tokens exceeds maximum of {max_query_tokens}. Please shorten your query.",
-                )
 
         try:
             # Default to all fact types if not specified
@@ -6244,6 +6439,7 @@ def _register_routes(app: FastAPI):
                 memories = []
                 mental_models = []
                 directives = []
+                carried: dict[str, tuple[str | None, list[str]]] = {}
                 for fact_type, facts in core_result.based_on.items():
                     if fact_type == "directives":
                         # Directives are dicts with id, name, content (not MemoryFact objects)
@@ -6275,8 +6471,18 @@ def _register_routes(app: FastAPI):
                                     context=fact.context,
                                     occurred_start=fact.occurred_start,
                                     occurred_end=fact.occurred_end,
+                                    mentioned_at=fact.mentioned_at,
+                                    document_id=fact.document_id,
+                                    chunk_id=fact.chunk_id,
+                                    tags=fact.tags,
+                                    metadata=fact.metadata,
                                 )
                             )
+                            if fact.attachment_ids is not None:
+                                carried[fact.id] = (fact.document_id, fact.attachment_ids)
+                # The evidence is what a client shows beside the answer, so it gets the
+                # attachments recall would have shown for the same memories.
+                await _attach_to_recall_results(app.state.memory, bank_id, memories, request_context, carried=carried)
                 based_on_result = ReflectBasedOn(memories=memories, mental_models=mental_models, directives=directives)
 
             # Build trace (tool_calls + llm_calls + observations) if tool_calls is requested
@@ -6513,12 +6719,27 @@ def _register_routes(app: FastAPI):
         bank_id: str,
         limit: int = Query(default=100, ge=0, description="Maximum number of entities to return"),
         offset: int = Query(default=0, ge=0, description="Offset for pagination"),
+        tags: list[str] | None = Query(
+            default=None,
+            description=(
+                "Only count memories carrying these tags. An entity is returned only when a matching "
+                "memory mentions it, and its mention count and dates cover the matching memories only."
+            ),
+        ),
+        tags_match: TagsMatch = Query(default="any", description="How `tags` match (same modes as listing memories)."),
+        tag_groups: str | None = Query(default=None, description=_TAG_GROUPS_QUERY_DESCRIPTION),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """List entities for a memory bank with pagination."""
         try:
             data = await app.state.memory.list_entities(
-                bank_id, limit=limit, offset=offset, request_context=request_context
+                bank_id,
+                tags=tags,
+                tags_match=tags_match,
+                tag_groups=_parse_tag_groups_query(tag_groups, tags),
+                limit=limit,
+                offset=offset,
+                request_context=request_context,
             )
             return EntityListResponse(
                 items=[EntityListItem(**e) for e in data["items"]],
@@ -6546,12 +6767,27 @@ def _register_routes(app: FastAPI):
         bank_id: str,
         limit: int = Query(default=1000, ge=0, description="Maximum number of co-occurrence edges to return"),
         min_count: int = Query(default=1, description="Minimum cooccurrence_count to include an edge"),
+        tags: list[str] | None = Query(
+            default=None,
+            description=(
+                "Only count memories carrying these tags. Edges and node mention counts are "
+                "computed from the matching memories only."
+            ),
+        ),
+        tags_match: TagsMatch = Query(default="any", description="How `tags` match (same modes as listing memories)."),
+        tag_groups: str | None = Query(default=None, description=_TAG_GROUPS_QUERY_DESCRIPTION),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Return entity co-occurrence graph for a bank."""
         try:
             return await app.state.memory.get_entity_graph(
-                bank_id, limit=limit, min_count=min_count, request_context=request_context
+                bank_id,
+                limit=limit,
+                min_count=min_count,
+                tags=tags,
+                tags_match=tags_match,
+                tag_groups=_parse_tag_groups_query(tag_groups, tags),
+                request_context=request_context,
             )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
@@ -6569,11 +6805,29 @@ def _register_routes(app: FastAPI):
         tags=["Entities"],
     )
     async def api_get_entity(
-        bank_id: str, entity_id: str, request_context: RequestContext = Depends(get_request_context)
+        bank_id: str,
+        entity_id: str,
+        tags: list[str] | None = Query(
+            default=None,
+            description=(
+                "Only count memories carrying these tags. The entity is a 404 when no matching memory "
+                "mentions it; its mention count and dates cover the matching memories only."
+            ),
+        ),
+        tags_match: TagsMatch = Query(default="any", description="How `tags` match (same modes as listing memories)."),
+        tag_groups: str | None = Query(default=None, description=_TAG_GROUPS_QUERY_DESCRIPTION),
+        request_context: RequestContext = Depends(get_request_context),
     ):
         """Get entity details with observations."""
         try:
-            entity = await app.state.memory.get_entity(bank_id, entity_id, request_context=request_context)
+            entity = await app.state.memory.get_entity(
+                bank_id,
+                entity_id,
+                tags=tags,
+                tags_match=tags_match,
+                tag_groups=_parse_tag_groups_query(tag_groups, tags),
+                request_context=request_context,
+            )
 
             if entity is None:
                 raise HTTPException(status_code=404, detail=f"Entity {entity_id} not found")
@@ -6775,12 +7029,12 @@ def _register_routes(app: FastAPI):
     ):
         """Create a mental model (async - returns operation_id)."""
         try:
-            # 1. Create the mental model with placeholder content
+            # 1. Create the mental model with an empty body; the async refresh fills it
             mental_model = await app.state.memory.create_mental_model(
                 bank_id=bank_id,
                 name=body.name,
                 source_query=body.source_query,
-                content="Generating content...",
+                content="",
                 mental_model_id=body.id if body.id else None,
                 tags=body.tags if body.tags else None,
                 max_tokens=body.max_tokens,
@@ -7017,12 +7271,13 @@ def _register_routes(app: FastAPI):
     )
     async def api_knowledge_base_tree(
         bank_id: str,
+        tag_filter: KnowledgeTagFilter = Depends(_knowledge_tag_filter),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Return the folder/page tree for a bank."""
         try:
             nodes = await app.state.memory.list_knowledge_nodes(
-                bank_id=bank_id, with_staleness=True, request_context=request_context
+                bank_id=bank_id, with_staleness=True, tag_filter=tag_filter, request_context=request_context
             )
             return KnowledgeTreeResponse(roots=_build_knowledge_tree(nodes))
         except OperationValidationError as e:
@@ -7085,7 +7340,7 @@ def _register_routes(app: FastAPI):
                 bank_id=bank_id,
                 name=body.name,
                 source_query=body.source_query,
-                content="Generating content...",
+                content="",
                 parent_id=body.parent_id,
                 tags=body.tags if body.tags else None,
                 max_tokens=body.max_tokens,
@@ -7176,12 +7431,13 @@ def _register_routes(app: FastAPI):
         bank_id: str,
         q: str = Query(..., description="Search query", min_length=1),
         limit: int = Query(10, ge=1, le=50, description="Maximum results to return"),
+        tag_filter: KnowledgeTagFilter = Depends(_knowledge_tag_filter),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Return knowledge pages ranked by fused BM25 + vector relevance."""
         try:
             results = await app.state.memory.search_knowledge_pages(
-                bank_id=bank_id, query=q, limit=limit, request_context=request_context
+                bank_id=bank_id, query=q, limit=limit, tag_filter=tag_filter, request_context=request_context
             )
             return KnowledgePageSearchResponse(
                 results=[KnowledgePageSearchResult(**r) for r in results],
@@ -7245,14 +7501,12 @@ def _register_routes(app: FastAPI):
             # parent_id is applied only when present in the body, so passing null
             # moves the node to the root (distinct from "not provided"), which is
             # what KEEP_PARENT stands in for. Page options live on the backing
-            # mental model and each applies only when supplied (so tags=[] clears,
-            # distinct from "not provided").
-            page_fields = {"source_query", "tags", "max_tokens", "trigger"} & body.model_fields_set
-            if body.name is None and "parent_id" not in body.model_fields_set and not page_fields:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Provide name, parent_id, source_query, tags, max_tokens, and/or trigger to update",
-                )
+            # mental model and take the opposite convention: null there means "not
+            # changing this", while an empty VALUE is a real change (tags=[] clears
+            # them). So a body that is null all the way down changes nothing at all,
+            # and the engine rejects it with a 400 before reading anything — a no-op
+            # authorizes no operation, and would otherwise hand the node's metadata
+            # to a caller the validator never got to judge.
             # One call, one transaction: a rename must not survive the move that
             # fails after it, which is what left clients retrying against a tree
             # they never asked for.
@@ -7261,9 +7515,11 @@ def _register_routes(app: FastAPI):
                 node_id=node_id,
                 name=body.name,
                 parent_id=body.parent_id if "parent_id" in body.model_fields_set else KEEP_PARENT,
-                source_query=body.source_query if "source_query" in page_fields else None,
-                tags=body.tags if "tags" in page_fields else None,
-                max_tokens=body.max_tokens if "max_tokens" in page_fields else None,
+                # Each page option defaults to None on the model, so an absent field
+                # and an explicit null are the same "not supplied" the engine expects.
+                source_query=body.source_query,
+                tags=body.tags,
+                max_tokens=body.max_tokens,
                 # Only the trigger fields the client stated: the engine patches them over
                 # the page's current trigger, and a full dump would carry this model's own
                 # defaults (mode="full", exclude_mental_models=False) into every update.
@@ -7275,7 +7531,7 @@ def _register_routes(app: FastAPI):
             # A new source query means the content is stale — rebuild it. Scheduled
             # only once the patch has committed, so a refresh is never queued for a
             # change that rolled back.
-            if "source_query" in page_fields and body.source_query is not None and updated.get("mental_model_id"):
+            if body.source_query is not None and updated.get("mental_model_id"):
                 await app.state.memory.submit_async_refresh_mental_model(
                     bank_id=bank_id,
                     mental_model_id=updated["mental_model_id"],
@@ -8169,6 +8425,132 @@ def _register_routes(app: FastAPI):
             ),
         )
 
+    async def _alias_response(bank_id: str, request_context: RequestContext) -> BankAliasesResponse:
+        """The bank's aliases, shaped for the wire. Shared by all three alias routes,
+        which each answer with the whole list so a client never has to re-fetch."""
+        aliases = await app.state.memory.list_bank_aliases(bank_id, request_context=request_context)
+        return BankAliasesResponse(
+            bank_id=bank_id,
+            aliases=[BankAliasEntry(alias=a.alias, primary=a.primary) for a in aliases],
+        )
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/aliases",
+        response_model=BankAliasesResponse,
+        summary="List the bank's aliases",
+        description=(
+            "Extra bank ids that reach this bank. Every endpoint accepts an alias wherever it "
+            "accepts a bank id, so callers can be moved onto a new id in phases while the old one "
+            "keeps working."
+        ),
+        operation_id="list_bank_aliases",
+        tags=["Banks"],
+    )
+    async def api_list_bank_aliases(bank_id: str, request_context: RequestContext = Depends(get_request_context)):
+        """List the extra ids this bank answers to."""
+        try:
+            return await _alias_response(bank_id, request_context)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/aliases")
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/aliases",
+        response_model=BankAliasesResponse,
+        status_code=201,
+        summary="Add an alias to the bank",
+        description=(
+            "Give the bank another id to answer to. Nothing is copied or moved: the bank keeps its "
+            "own id and all of its data, and the alias is only a second way to reach it — which is "
+            "what makes it a zero-downtime alternative to renaming.\n\n"
+            "Returns 409 if the name is already a bank or another alias."
+        ),
+        operation_id="create_bank_alias",
+        tags=["Banks"],
+    )
+    @audited("create_bank_alias")
+    async def api_create_bank_alias(
+        bank_id: str, request: CreateBankAliasRequest, request_context: RequestContext = Depends(get_request_context)
+    ):
+        """Add an extra id that reaches this bank."""
+        try:
+            await app.state.memory.create_bank_alias(
+                bank_id, request.alias, primary=request.primary, request_context=request_context
+            )
+            return await _alias_response(bank_id, request_context)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/aliases")
+
+    @app.patch(
+        "/v1/default/banks/{bank_id}/aliases/{alias}",
+        response_model=BankAliasesResponse,
+        summary="Show this alias in place of the bank id",
+        description=(
+            "Present the bank under one of its aliases. Purely cosmetic: the bank keeps its own "
+            "`bank_id`, which every other part of the system — authorisation, metering, exports, "
+            "audit logs — continues to use.\n\n"
+            "Promoting an alias demotes whichever one was shown before, so a bank is presented "
+            "under at most one alias. Send `primary: false` to go back to showing its own id."
+        ),
+        operation_id="set_bank_alias_primary",
+        tags=["Banks"],
+    )
+    @audited("set_bank_alias_primary")
+    async def api_set_bank_alias_primary(
+        bank_id: str,
+        alias: str,
+        request: SetBankAliasPrimaryRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Choose which id this bank is displayed under."""
+        try:
+            if not await app.state.memory.set_bank_alias_primary(
+                bank_id, alias, request.primary, request_context=request_context
+            ):
+                raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' has no alias '{alias}'")
+            return await _alias_response(bank_id, request_context)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/aliases/{alias}")
+
+    @app.delete(
+        "/v1/default/banks/{bank_id}/aliases/{alias}",
+        response_model=BankAliasesResponse,
+        summary="Remove an alias from the bank",
+        description=(
+            "Stop an id reaching this bank. The bank and its memories are untouched; only the extra "
+            "name goes away, and callers still using it get the same 404 (or new empty bank) they "
+            "would have got before it existed."
+        ),
+        operation_id="delete_bank_alias",
+        tags=["Banks"],
+    )
+    @audited("delete_bank_alias")
+    async def api_delete_bank_alias(
+        bank_id: str, alias: str, request_context: RequestContext = Depends(get_request_context)
+    ):
+        """Detach one alias from this bank."""
+        try:
+            if not await app.state.memory.delete_bank_alias(bank_id, alias, request_context=request_context):
+                raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' has no alias '{alias}'")
+            return await _alias_response(bank_id, request_context)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/aliases/{alias}")
+
     @app.put(
         "/v1/default/banks/{bank_id}",
         response_model=BankProfileResponse,
@@ -9003,14 +9385,18 @@ def _register_routes(app: FastAPI):
             else:
                 raise HTTPException(status_code=404, detail="File not found")
 
-            data = await app.state.memory.retrieve_bank_file(bank_id, key, request_context)
-            if data is None:
+            file_info = await app.state.memory.retrieve_bank_file_stream(bank_id, key, request_context)
+            if file_info is None:
                 raise HTTPException(status_code=404, detail="File not found")
 
-            return Response(
-                content=data,
+            headers = {"Content-Disposition": f'attachment; filename="{bank_id}-documents.zip"'}
+            if file_info.size is not None:
+                headers["Content-Length"] = str(file_info.size)
+
+            return StreamingResponse(
+                file_info.stream,
                 media_type="application/zip",
-                headers={"Content-Disposition": f'attachment; filename="{bank_id}-documents.zip"'},
+                headers=headers,
             )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
@@ -9295,6 +9681,7 @@ def _register_routes(app: FastAPI):
                 bank_id=bank_id,
                 request_context=request_context,
                 observation_scopes=observation_scopes,
+                caller_requested=True,
             )
             return ConsolidationResponse(
                 operation_id=result["operation_id"],
@@ -9649,6 +10036,7 @@ def _register_routes(app: FastAPI):
     async def api_retain(
         bank_id: str,
         request: RetainRequest,
+        http_request: Request,
         request_context: RequestContext = Depends(get_request_context),
         _precheck: None = Depends(precheck_for(PrecheckOperation.RETAIN)),
         _admit: None = Depends(admit_for(PrecheckOperation.RETAIN)),
@@ -9817,9 +10205,14 @@ def _register_routes(app: FastAPI):
                 # Synchronous processing: one batch per strategy group, aggregate results
                 total_items_count = 0
                 total_usage = TokenUsage(input_tokens=0, output_tokens=0, total_tokens=0)
-                with metrics.record_operation("retain", bank_id=bank_id, source="api"):
+
+                # A coroutine rather than an inline loop so the whole thing can be run
+                # as one cancellable task below; the totals stay in the enclosing scope
+                # because the response is built from them.
+                async def _retain_groups() -> None:
+                    nonlocal total_items_count, total_usage
                     for group_strategy, contents in strategy_groups.items():
-                        result, usage = await app.state.memory.retain_batch_async(
+                        _, usage = await app.state.memory.retain_batch_async(
                             bank_id=bank_id,
                             contents=contents,
                             document_tags=request.document_tags,
@@ -9840,6 +10233,19 @@ def _register_routes(app: FastAPI):
                                 output_tokens=total_usage.output_tokens + usage.output_tokens,
                                 total_tokens=total_usage.total_tokens + usage.total_tokens,
                             )
+
+                with metrics.record_operation("retain", bank_id=bank_id, source="api"):
+                    # A sync retain has no operation row and no ack, so nothing else can
+                    # stop it once it starts: without this an abandoned one runs to
+                    # completion, holding an LLM slot and committing work nobody will
+                    # read (issue #4526). The async path is unaffected — it returns
+                    # before any extraction runs, and DELETE /operations/{id} stops it.
+                    await run_task_cancellable_on_disconnect(
+                        http_request,
+                        _retain_groups(),
+                        operation="retain",
+                        bank_id=bank_id,
+                    )
 
                 return RetainResponse.model_validate(
                     {

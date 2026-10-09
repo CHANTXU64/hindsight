@@ -42,6 +42,13 @@ class Fact(BaseModel):
     entities: list[str] = Field(default_factory=list)
     occurred_start: str | None = None
     occurred_end: str | None = None
+    from_attachments: list[int] | None = None
+    """1-based numbers of the chunk's attachments this fact was read off — the edge
+    that makes a fact (and what it is consolidated into) carry its attachments."""
+    labels: dict[str, str | None] | None = None
+    """The bank's entity-label values for this fact (``{"kind": "rule"}``), keyed by label
+    group. Only meaningful when the bank configures ``entity_labels``; a group with
+    ``tag: true`` turns its value into a ``key:value`` tag on the fact."""
 
 
 class ExtractedFacts(BaseModel):

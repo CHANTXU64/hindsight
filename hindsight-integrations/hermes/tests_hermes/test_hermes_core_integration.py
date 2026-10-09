@@ -63,6 +63,7 @@ def _make_hindsight_provider():
     provider._retain_context = "test-context"
     provider._retain_async = False
     provider._bank_id = "test-bank"
+    provider._write_bank_ids = ["test-bank"]
     # Carried recall state the switch path clears.
     provider._recall_cache = HindsightRecallCache(initial_session_id="old-sid")
     # Sync thread tracking (legacy alias at the writer).

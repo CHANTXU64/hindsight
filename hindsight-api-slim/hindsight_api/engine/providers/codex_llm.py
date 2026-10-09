@@ -41,6 +41,7 @@ from hindsight_api.engine.llm_interface import (
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
 from hindsight_api.engine.llm_transport import build_aiohttp_timeout
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
+from hindsight_api.engine.providers.openai_compatible_llm import _strip_code_fences
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
 from hindsight_api.engine.structured_output import provider_json_schema, strict_json_schema
 from hindsight_api.metrics import get_metrics_collector
@@ -297,7 +298,13 @@ class CodexLLM(LLMInterface):
         return {
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json",
-            "OpenAI-Account-ID": self.account_id,
+            # Must be "ChatGPT-Account-ID" — the name the official Codex CLI
+            # sends (codex-rs/model-provider/src/bearer_auth_provider.rs). We
+            # sent "OpenAI-Account-ID" until #4951, where the backend answered
+            # 429 usage_limit_reached for credentials the CLI used fine on the
+            # same account, model and route; renaming the header alone fixed
+            # it, so the backend evidently ignores the other spelling.
+            "ChatGPT-Account-ID": self.account_id,
             "User-Agent": _CODEX_USER_AGENT,
             "Origin": "https://chatgpt.com",
             "originator": _CODEX_ORIGINATOR,
@@ -638,12 +645,10 @@ class CodexLLM(LLMInterface):
                     content = json.dumps(tool_input)
                     result = tool_input if skip_validation else response_format.model_validate(tool_input)
                 elif response_format is not None:
-                    # Models may wrap JSON in markdown
-                    clean_content = content
-                    if "```json" in content:
-                        clean_content = content.split("```json")[1].split("```")[0].strip()
-                    elif "```" in content:
-                        clean_content = content.split("```")[1].split("```")[0].strip()
+                    # Models may wrap JSON in markdown; the shared helper strips
+                    # fences line-based, so a JSON value that itself contains the
+                    # text "```json" is no longer truncated (#4819).
+                    clean_content = _strip_code_fences(content)
 
                     try:
                         json_data = json.loads(clean_content)

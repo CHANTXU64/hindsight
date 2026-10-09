@@ -1348,6 +1348,9 @@ class TestObservationDrillDown:
                     bank_id=bank_id,
                     memory_ids=obs["source_fact_ids"][:2],  # Take first 2
                     depth="chunk",
+                    tags=None,
+                    tags_match="any",
+                    tag_groups=None,
                 )
 
             assert "results" in expand_result
@@ -2414,6 +2417,31 @@ class TestBuildResponseModel:
         assert len(result.updates) == 2
         assert len(result.deletes) == 1
 
+    def test_fact_ids_pin_source_fact_ids_in_schema(self):
+        """#5273: the schema only allows the batch's fact ids, at least one per action."""
+        model = _build_response_model(None, fact_ids=["f1", "f2"])
+        defs = model.model_json_schema()["$defs"]
+        for action in ("_Create", "_Update"):
+            ids = defs[action]["properties"]["source_fact_ids"]
+            assert ids["items"] == {"type": "string", "enum": ["f1", "f2"]}
+            assert ids["minItems"] == 1
+
+    def test_fact_ids_omit_min_items_when_unsupported(self):
+        model = _build_response_model(None, fact_ids=["f1"], supports_max_items=False)
+        ids = model.model_json_schema()["$defs"]["_Create"]["properties"]["source_fact_ids"]
+        assert ids["items"]["enum"] == ["f1"]
+        assert "minItems" not in ids
+
+    def test_fact_ids_are_a_schema_hint_not_validation(self):
+        """A provider that ignores the schema must not fail the whole batch."""
+        model = _build_response_model(3, fact_ids=["f1"])
+        result = model(
+            creates=[{"text": "obs", "source_fact_ids": "not-in-batch"}],
+            updates=[{"text": "upd", "observation_id": "o", "source_fact_ids": []}],
+        )
+        assert result.creates[0].source_fact_ids == ["not-in-batch"]
+        assert result.updates[0].source_fact_ids == []
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize(("remaining_slots", "expected_creates"), [(0, 0), (2, 2)])
     async def test_unsupported_max_items_still_truncates_creates(
@@ -2455,7 +2483,7 @@ class TestBuildResponseModel:
         )
 
         response_model = llm_config.call.await_args.kwargs["response_format"]
-        assert response_model is _ConsolidationBatchResponse
+        assert "maxItems" not in response_model.model_json_schema()["properties"]["creates"]
         assert len(result.creates) == expected_creates
 
 
@@ -3308,4 +3336,107 @@ async def test_consolidation_strategy_source_facts_limits_reach_the_scope_recall
             bank_defaults.consolidation_source_facts_max_tokens_per_observation,
         ), "a scope no strategy claims keeps the bank-wide limits"
     finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+def test_action_source_fact_ids_drop_repeats():
+    """A looping model can repeat one fact id thousands of times (#4799); keep each once, in order."""
+    from hindsight_api.engine.consolidation.consolidator import _CreateAction, _UpdateAction
+
+    ids = ["a"] * 1000 + ["b", "a", "c"]
+    assert _CreateAction(text="t", source_fact_ids=ids).source_fact_ids == ["a", "b", "c"]
+    assert _UpdateAction(text="t", observation_id="o", source_fact_ids=ids).source_fact_ids == ["a", "b", "c"]
+    assert _CreateAction(text="t", source_fact_ids="a").source_fact_ids == ["a"]
+
+
+def test_build_observations_for_llm_shows_each_source_once():
+    """Rows written before #4799 may repeat ids; the prompt must not repeat the fact text per copy."""
+    from hindsight_api.engine.consolidation.consolidator import _build_observations_for_llm
+    from hindsight_api.engine.response_models import MemoryFact
+
+    obs = MemoryFact(id="obs", text="Alice hikes.", fact_type="observation", source_fact_ids=["f1"] * 3000 + ["f2"])
+    facts = {fid: MemoryFact(id=fid, text=f"fact {fid}", fact_type="experience") for fid in ("f1", "f2")}
+
+    [serialized] = _build_observations_for_llm([obs], facts)
+
+    assert serialized["proof_count"] == 2
+    assert [m["text"] for m in serialized["source_memories"]] == ["fact f1", "fact f2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_repeated_source_ids_are_stored_once(memory: MemoryEngine, request_context):
+    """Repeated ids in an LLM create/update, and duplicates already on the row, are stored once (#4799)."""
+    import re
+
+    from hindsight_api.engine.consolidation.consolidator import (
+        _ConsolidationBatchResponse,
+        _CreateAction,
+        _UpdateAction,
+    )
+    from hindsight_api.engine.providers.mock_llm import MockLLM
+
+    bank_id = f"test-dup-src-{uuid.uuid4().hex[:8]}"
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+    obs_id = None
+
+    def callback(messages, scope):
+        if scope != "consolidation":
+            return _ConsolidationBatchResponse()
+        prompt = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
+        fact_ids = re.findall(r"\[([0-9a-f-]{36})\]", prompt)
+        if not fact_ids:
+            return _ConsolidationBatchResponse()
+        if obs_id is None:
+            return _ConsolidationBatchResponse(
+                creates=[_CreateAction(text="Alice hikes.", source_fact_ids=[fact_ids[0]] * 50)]
+            )
+        return _ConsolidationBatchResponse(
+            updates=[
+                _UpdateAction(
+                    text="Alice hikes and runs trails.",
+                    observation_id=str(obs_id),
+                    source_fact_ids=[fact_ids[0]] * 50,
+                )
+            ]
+        )
+
+    mock_llm = MockLLM(provider="mock", api_key="", base_url="", model="mock-model")
+    mock_llm.set_response_callback(callback)
+    wrapper = MagicMock()
+    wrapper.with_config.return_value = mock_llm
+    original_llm = memory._consolidation_llm_config
+    memory._consolidation_llm_config = wrapper
+
+    try:
+        async with memory._pool.acquire() as conn:
+            [first] = await _insert_memories_with_tags(conn, bank_id, ["Alice loves hiking."])
+        await run_consolidation_job(memory_engine=memory, bank_id=bank_id, request_context=request_context)
+
+        [obs] = (await memory.list_memory_units(bank_id, fact_type="observation", request_context=request_context))[
+            "items"
+        ]
+        assert obs["source_memory_ids"] == [str(first)]
+        assert obs["proof_count"] == 1
+        obs_id = obs["id"]
+
+        async with memory._pool.acquire() as conn:
+            # Forge a row written before the fix (one source repeated many times);
+            # no public API can produce this state any more.
+            await conn.execute(
+                "UPDATE memory_units SET source_memory_ids = $1, proof_count = 200 WHERE id = $2",
+                [first] * 200,
+                uuid.UUID(obs_id),
+            )
+            [second] = await _insert_memories_with_tags(conn, bank_id, ["Alice runs on trails."])
+        await run_consolidation_job(memory_engine=memory, bank_id=bank_id, request_context=request_context)
+
+        [obs] = (await memory.list_memory_units(bank_id, fact_type="observation", request_context=request_context))[
+            "items"
+        ]
+        assert "trails" in obs["text"]
+        assert obs["source_memory_ids"] == [str(first), str(second)]
+        assert obs["proof_count"] == 2
+    finally:
+        memory._consolidation_llm_config = original_llm
         await memory.delete_bank(bank_id, request_context=request_context)

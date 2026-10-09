@@ -34,7 +34,7 @@ from plugins.memory.hindsight import (
     _load_simple_env,
     _build_embedded_profile_env,
     _normalize_observation_scopes,
-    _normalize_retain_tags,
+    _normalize_string_list,
     _resolve_bank_id_template,
     _WRITER_SENTINEL,
 )
@@ -276,8 +276,8 @@ def provider_with_config(tmp_path, monkeypatch):
     return _make
 
 
-def test_normalize_retain_tags_accepts_csv_and_dedupes():
-    assert _normalize_retain_tags("agent:fakeassistantname, source_system:hermes-agent, agent:fakeassistantname") == [
+def test_normalize_string_list_accepts_csv_and_dedupes():
+    assert _normalize_string_list("agent:fakeassistantname, source_system:hermes-agent, agent:fakeassistantname") == [
         "agent:fakeassistantname",
         "source_system:hermes-agent",
     ]
@@ -393,15 +393,20 @@ class TestConfig:
 
 
     def test_get_client_passes_idle_timeout_to_hindsight_embedded(self, monkeypatch):
+        """Preserve daemon config forwarding after the out-of-process migration."""
+        from plugins.memory.hindsight.embedded import LocalRuntimeStatus
         captured = {}
 
-        class FakeHindsightEmbedded:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
+        def start(config, profile):
+            captured.update(config)
+            captured["profile"] = profile
+            return "http://127.0.0.1:54321"
 
-        monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
-        monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
-
+        monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: LocalRuntimeStatus(True))
+        monkeypatch.setattr("plugins.memory.hindsight._start_daemon", start)
+        monkeypatch.setattr(HindsightMemoryProvider, "_announce_slow_first_start", lambda *a: None)
+        client_calls = []
+        monkeypatch.setattr("hindsight_client.Hindsight", lambda **kw: client_calls.append(kw) or _make_mock_client())
         p = HindsightMemoryProvider()
         p._mode = "local_embedded"
         p._config = {
@@ -410,13 +415,14 @@ class TestConfig:
             "llm_api_key": "test-key",
             "llm_model": "test-model",
             "idle_timeout": 0,
+            "llm_base_url": "http://localhost:8060/v1",
         }
-        p._llm_base_url = "http://localhost:8060/v1"
-
         p._get_client()
-
-        assert captured["idle_timeout"] == 0
-        assert captured["llm_provider"] == "openai"
+        assert captured["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] == "0"
+        assert captured["HINDSIGHT_API_LLM_PROVIDER"] == "openai"
+        assert captured["HINDSIGHT_API_LLM_BASE_URL"] == "http://localhost:8060/v1"
+        assert captured["profile"] == "hermes"
+        assert client_calls[0]["base_url"] == "http://127.0.0.1:54321"
 
 
 class TestPostSetup:
@@ -1260,19 +1266,12 @@ class TestSharedEventLoopLifecycle:
 
 class TestShutdown:
     def test_local_embedded_shutdown_closes_inner_async_client_on_shared_loop(self, provider):
-        inner_client = _make_mock_client()
-        embedded = MagicMock()
-        embedded._client = inner_client
-        embedded.close = MagicMock()
-
+        # Upstream now holds one HTTP client, not a HindsightEmbedded wrapper.
+        client = _make_mock_client()
         provider._mode = "local_embedded"
-        provider._client = embedded
-
+        provider._client = client
         provider.shutdown()
-
-        inner_client.aclose.assert_awaited_once()
-        embedded.close.assert_called_once()
-        assert embedded._client is None
+        client.aclose.assert_awaited_once()
         assert provider._client is None
 
 
@@ -1322,11 +1321,6 @@ class TestPostSetupEnvEncoding:
         monkeypatch.setattr("hermes_cli.memory_setup._curses_select",
                             lambda *a, **kw: 0)  # cloud mode
         monkeypatch.setattr("hermes_cli.config.save_config", lambda c: None)
-        # This test owns env-file encoding, not dependency provisioning.
-        monkeypatch.setattr(
-            "plugins.memory.hindsight.dependencies.prepare_remote_dependencies",
-            lambda **kw: (True, "Client already available"),
-        )
         # First line: API key prompt (readline). Second line: API URL (input).
         monkeypatch.setattr(sys, "stdin", io.StringIO("sk-new\n\n"))
 
@@ -1348,58 +1342,39 @@ class TestPostSetupEnvEncoding:
         assert "﻿" not in content
 
 
-class TestClientAutoUpgradeRoutesThroughPM:
-    """Runtime preparation uses the declared PM union, never raw pip or live import replacement."""
+class TestClientDependencyWarnings:
+    """Official policy: runtime only warns; package admission owns dependencies."""
 
-    def _init_with_outdated_client(self, tmp_path, monkeypatch, error=None):
+    @pytest.mark.parametrize("missing", [False, True])
+    def test_initialize_never_installs_dependencies(self, tmp_path, monkeypatch, caplog, missing):
         import importlib.metadata as md
-        import subprocess as subprocess_mod
         import pm
-        from plugins.memory.hindsight import dependencies
+        import subprocess
 
         config_path = tmp_path / "hindsight" / "config.json"
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(json.dumps({"mode": "cloud"}))
         monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
         real_version = md.version
-        monkeypatch.setattr(md, "version", lambda name: "0.0.1" if name == "hindsight-client" else real_version(name))
-        monkeypatch.setattr(dependencies, "version", md.version)
+
+        def version(name):
+            if name == "hindsight-client":
+                if missing:
+                    raise md.PackageNotFoundError(name)
+                return "0.0.1"
+            return real_version(name)
+
         calls = []
-
-        def sync(**kwargs):
-            calls.append(kwargs)
-            if error:
-                raise RuntimeError(error)
-
-        monkeypatch.setattr(pm, "sync_venv", sync)
-
-        def no_raw_install(*a, **kw):
-            raise AssertionError("unexpected raw or retired dependency installer")
-
-        monkeypatch.setattr(subprocess_mod, "run", no_raw_install)
-        monkeypatch.setattr("tools.lazy_deps.install_specs", no_raw_install)
-        provider = HindsightMemoryProvider()
-        provider.initialize(session_id="s", hermes_home=str(tmp_path), platform="cli")
-        return calls
-
-    def test_upgrade_prepares_pm_environment_not_live_imports(self, tmp_path, monkeypatch, caplog):
-        import logging
-
-        with caplog.at_level(logging.WARNING):
-            calls = self._init_with_outdated_client(tmp_path, monkeypatch)
-        assert calls == [{"explicit": False}]
-        assert "Restart Hermes" in caplog.text
+        monkeypatch.setattr(md, "version", version)
+        monkeypatch.setattr(pm, "sync_venv", lambda **kw: calls.append("pm"))
+        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: calls.append("subprocess"))
+        monkeypatch.setattr("tools.lazy_deps.install_specs", lambda *a, **kw: calls.append("legacy"))
+        with caplog.at_level("WARNING"):
+            HindsightMemoryProvider().initialize(session_id="s", platform="cli")
+        assert calls == []
+        if not missing:
+            assert "hermes plugins update hindsight" in caplog.text
         assert "upgraded to" not in caplog.text
-
-    def test_blocked_upgrade_is_nonfatal_and_surfaces_reason(self, tmp_path, monkeypatch, caplog):
-        import logging
-
-        with caplog.at_level(logging.WARNING):
-            calls = self._init_with_outdated_client(
-                tmp_path, monkeypatch, "runtime installs are disabled on this deployment",
-            )
-        assert calls == [{"explicit": False}]
-        assert "runtime installs are disabled" in caplog.text
 
 
 class TestMultiplexBackgroundScope:
@@ -1416,17 +1391,20 @@ class TestMultiplexBackgroundScope:
 
         created = []
 
-        class FakeHindsightEmbedded:
-            def __init__(self, **kwargs):
-                created.append(kwargs["llm_api_key"])
-                self._manager = SimpleNamespace(is_running=lambda profile: False, stop=lambda profile: None)
-                self._ensure_started = lambda: None
+        from plugins.memory.hindsight.embedded import LocalRuntimeStatus
+
+        def start(config, profile):
+            created.append(config["HINDSIGHT_API_LLM_API_KEY"])
+            return "http://127.0.0.1:54321"
 
         dem = SimpleNamespace(console=None)
-        monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
         monkeypatch.setitem(sys.modules, "hindsight_embed", SimpleNamespace(daemon_embed_manager=dem))
         monkeypatch.setitem(sys.modules, "hindsight_embed.daemon_embed_manager", dem)
-        monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+        monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: LocalRuntimeStatus(True))
+        monkeypatch.setattr("plugins.memory.hindsight._start_daemon", start)
+        monkeypatch.setattr("plugins.memory.hindsight._daemon_is_running", lambda profile: False)
+        monkeypatch.setattr(HindsightMemoryProvider, "_announce_slow_first_start", lambda *a: None)
+        monkeypatch.setattr("hindsight_client.Hindsight", lambda **kw: _make_mock_client())
 
         home = tmp_path / "profiles" / "p1"
         (home / "hindsight").mkdir(parents=True)
