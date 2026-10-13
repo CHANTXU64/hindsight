@@ -358,16 +358,6 @@ def run_recall_preprocessor(
         client_kwargs["api_key"] = resolved_api_key
     if resolved_api_mode:
         client_kwargs["api_mode"] = resolved_api_mode
-    client, final_model = aux._get_cached_client(
-        resolved_provider,
-        resolved_model,
-        **client_kwargs,
-    )
-    if client is None or not final_model or final_model != resolved_model:
-        raise RuntimeError(
-            "configured recall-preprocessor route unavailable: "
-            f"requested={resolved_model!r} resolved={final_model!r}"
-        )
 
     results = [str(text) for text in previous_recall_results]
     payload = {
@@ -392,22 +382,33 @@ def run_recall_preprocessor(
             ),
         },
     ]
-    kwargs = aux._build_call_kwargs(
-        resolved_provider,
-        final_model,
-        messages,
-        temperature=0,
-        max_tokens=_MAX_OUTPUT_TOKENS,
-        timeout=timeout_seconds,
-        extra_body=aux._get_task_extra_body(_AUXILIARY_TASK),
-        reasoning_config=None,
-        base_url=str(getattr(client, "base_url", "") or ""),
-    )
-
     started = time.monotonic()
     active_provider = resolved_provider
-    active_model = final_model
+    active_model = resolved_model
     try:
+        # Client setup can fail before any request (e.g. no usable credential).
+        # Keep it inside the same explicit-fallback boundary as the request.
+        client, final_model = aux._get_cached_client(
+            resolved_provider,
+            resolved_model,
+            **client_kwargs,
+        )
+        if client is None or not final_model or final_model != resolved_model:
+            raise RuntimeError(
+                "configured recall-preprocessor route unavailable: "
+                f"requested={resolved_model!r} resolved={final_model!r}"
+            )
+        kwargs = aux._build_call_kwargs(
+            resolved_provider,
+            final_model,
+            messages,
+            temperature=0,
+            max_tokens=_MAX_OUTPUT_TOKENS,
+            timeout=timeout_seconds,
+            extra_body=aux._get_task_extra_body(_AUXILIARY_TASK),
+            reasoning_config=None,
+            base_url=str(getattr(client, "base_url", "") or ""),
+        )
         response = aux._validate_llm_response(
             client.chat.completions.create(**kwargs),
             task=_AUXILIARY_TASK,
@@ -427,7 +428,7 @@ def run_recall_preprocessor(
                 _AUXILIARY_TASK,
                 resolved_provider,
                 reason=str(primary_error) or type(primary_error).__name__,
-                failed_model=final_model,
+                failed_model=resolved_model,
             )
         )
         if fallback_client is None or not fallback_model:

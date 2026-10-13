@@ -33,6 +33,7 @@ Intent / invariants:
 - Cache misses can recall synchronously; P5 consumes current user text, previous assistant text and the preceding real recall snapshot, selecting references and optionally generating a new query.
 - No raw post-turn background recall; failed preprocessing/retrieval preserves the specified fallback semantics, including empty-cache behavior.
 - Stale session/generation results must not re-enter context after timeout, rewind or rotation; the host receives the full bounded prefetch timeout and turn metadata.
+- Primary client construction, request, and response-validation failures try only the configured explicit fallback chain. An unavailable client or substituted model must not bypass that chain; missing/unusable fallbacks preserve the full prior recall snapshot.
 - Existing P5 prompt, configured auxiliary routing and fallback policy stay intact. Upstream score filtering and optional multi-bank routing apply to new SDK retrievals without replacing P5.
 - Requires the existing Hermes Fork MemoryManager turn/timeout hooks; this repository does not modify the Hermes host.
 

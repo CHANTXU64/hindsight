@@ -328,8 +328,11 @@ def test_recall_preprocessor_uses_default_luna_direct_path_without_generic_fallb
     assert decision.new_query == "具体配置修复步骤"
 
 
-def test_recall_preprocessor_uses_configured_fallback_after_primary_connection_failure(
-    monkeypatch,
+@pytest.mark.parametrize(
+    "failure_stage", ["request", "missing_client", "client_exception", "model_substitution"]
+)
+def test_recall_preprocessor_uses_configured_fallback_after_primary_failure(
+    monkeypatch, failure_stage,
 ):
     preprocessor = importlib.import_module(
         "plugins.memory.hindsight.recall_preprocessor"
@@ -374,12 +377,24 @@ def test_recall_preprocessor_uses_configured_fallback_after_primary_connection_f
         ],
     )
     captured = {}
+    expected_reason = "primary route unavailable"
+    if failure_stage in {"missing_client", "model_substitution"}:
+        returned_model = "wrong-model" if failure_stage == "model_substitution" else "gpt-5.6-luna"
+        expected_reason = (
+            "configured recall-preprocessor route unavailable: "
+            f"requested='gpt-5.6-luna' resolved={returned_model!r}"
+        )
 
-    monkeypatch.setattr(
-        aux,
-        "_get_cached_client",
-        lambda provider, model, **kwargs: (primary_client, model),
-    )
+    def _primary_client(_provider, model, **kwargs):
+        if failure_stage == "client_exception":
+            raise ConnectionError("primary route unavailable")
+        if failure_stage == "missing_client":
+            return None, model
+        if failure_stage == "model_substitution":
+            return primary_client, "wrong-model"
+        return primary_client, model
+
+    monkeypatch.setattr(aux, "_get_cached_client", _primary_client)
     monkeypatch.setattr(
         aux,
         "_build_call_kwargs",
@@ -429,7 +444,7 @@ def test_recall_preprocessor_uses_configured_fallback_after_primary_connection_f
     assert captured["fallback_resolution"] == (
         "hindsight_recall_preprocessor",
         "openai-codex",
-        "primary route unavailable",
+        expected_reason,
         "gpt-5.6-luna",
     )
     client, model, label, call_kwargs = captured["fallback_call"]
@@ -688,6 +703,46 @@ def test_recall_preprocessor_codex_alias_still_requires_terminal_model(
             previous_recall_query="old query",
             previous_recall_results=[],
         )
+
+
+@pytest.mark.parametrize(
+    "fallback_state", ["not_configured", "invalid", "unavailable", "request_failed", "wrong_model"]
+)
+def test_client_setup_failure_preserves_snapshot_when_fallback_cannot_succeed(
+    monkeypatch, fallback_state,
+):
+    preprocessor = importlib.import_module("plugins.memory.hindsight.recall_preprocessor")
+    from agent import auxiliary_client as aux
+
+    chain = [{"provider": "deepseek", "model": "fallback-model"}]
+    if fallback_state == "not_configured":
+        chain = []
+    elif fallback_state == "invalid":
+        chain = [{"provider": "auto", "model": "fallback-model"}]
+    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda task: {
+        "provider": "openai-codex", "model": "gpt-6-luna", "fallback_chain": chain,
+    })
+    monkeypatch.setattr(aux, "_get_cached_client", lambda *args, **kwargs: (None, "gpt-6-luna"))
+    client = None if fallback_state in {"not_configured", "unavailable"} else object()
+    resolve_fallback = MagicMock(return_value=(client, "fallback-model", "fallback_chain[0](deepseek)"))
+    monkeypatch.setattr(aux, "_try_configured_fallback_chain", resolve_fallback)
+    response = SimpleNamespace(model="wrong-model", choices=[SimpleNamespace(
+        message=SimpleNamespace(content='{"drop_old_refs":[1],"new_query":null}')
+    )])
+    call_fallback = MagicMock(return_value=None if fallback_state == "request_failed" else response)
+    monkeypatch.setattr(aux, "_call_fallback_candidate_sync", call_fallback)
+    recall = MagicMock(side_effect=AssertionError("old snapshot must be retained"))
+    snapshot = RecallSnapshot(query="old query", results=("old memory",))
+
+    outcome = preprocessor.apply_recall_preprocessor(
+        current_user_message="test", previous_assistant_message="test",
+        previous_snapshot=snapshot, recall_snapshot_for_query=recall,
+    )
+
+    assert outcome.snapshot == snapshot
+    assert resolve_fallback.call_count == (0 if fallback_state == "invalid" else 1)
+    assert call_fallback.call_count == (1 if fallback_state in {"request_failed", "wrong_model"} else 0)
+    recall.assert_not_called()
 
 
 def test_recall_preprocessor_rejects_resolved_model_substitution(monkeypatch):
