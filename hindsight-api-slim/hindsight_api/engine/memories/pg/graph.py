@@ -36,8 +36,9 @@ from typing import Any
 
 from ....config import get_config
 from ...db.base import DatabaseConnection
+from ...db_utils import acquire_with_retry
 from ...search.tags import TagGroup, TagsMatch, build_tag_filter_clause
-from ..base import EntityPrunePassResult, RelinkPassResult
+from ..base import GRAPH_MAX_EDGES, EntityPrunePassResult, RelinkPassResult
 from .links import (
     MAX_TEMPORAL_LINKS_PER_UNIT,
     _bulk_insert_links,
@@ -100,10 +101,6 @@ _PRUNE_BATCH_MAX_RETRIES = 3
 # 1000-element IN-list limit (ops_oracle expands ``= ANY(...)`` into a literal
 # list), which a bulk delete would otherwise blow straight through.
 _ENQUEUE_LOOKUP_CHUNK = 500
-
-# Cap at 10k edges — the UI can't usefully render more, and uncapped queries
-# on highly-connected graphs (e.g. 1000 nodes with 500k+ edges) are too slow.
-_GRAPH_MAX_EDGES = 10000
 
 # Columns the graph view renders: nodes take id/text/date/context/entities,
 # the table rows take the rest, and `source_memory_ids` is what lets the caller
@@ -323,7 +320,7 @@ async def graph_direct_links(
         LIMIT $2
         """,
         _as_uuids(unit_ids),
-        _GRAPH_MAX_EDGES,
+        GRAPH_MAX_EDGES,
     )
     return [dict(row) for row in rows]
 
@@ -669,8 +666,6 @@ async def relink_pass(
             drained = False
             break
 
-        from ...memory_engine import acquire_with_retry
-
         async with acquire_with_retry(backend) as conn:
             async with conn.transaction():
                 unit_ids = await ops.claim_graph_maintenance_batch(
@@ -794,8 +789,6 @@ async def _relink_batch(
         if counts.get((r["id"], "semantic"), 0) < MAX_SEMANTIC_LINKS_PER_UNIT and r["embedding"] is not None
     ]
     if semantic_needs:
-        from ...memory_engine import acquire_with_retry
-
         seed_ids = [r["id"] for r in semantic_needs]
         seed_embs = [r["embedding"] for r in semantic_needs]
         seed_ftypes = [r["fact_type"] for r in semantic_needs]
@@ -868,7 +861,9 @@ async def enqueue_entity_prune_candidates(
     queue_table = fq_table("entity_maintenance_queue")
     ue_table = fq_table("unit_entities")
     entities_table = fq_table("entities")
-    unit_uuids = _as_uuids(list(affected_unit_ids))
+    # Sorted before chunking: each chunk locks its memory rows ascending, so the
+    # whole call does too and two overlapping bulk releases cannot cycle (#6229).
+    unit_uuids = sorted(_as_uuids(list(affected_unit_ids)))
 
     # Chunked because a bulk delete can hand in thousands of unit ids and the
     # lookup binds them with `= ANY(...)`, which ops_oracle expands into a
@@ -880,6 +875,7 @@ async def enqueue_entity_prune_candidates(
             queue_table,
             entities_table,
             ue_table,
+            fq_table("memory_units"),
             bank_id,
             unit_uuids[start : start + _ENQUEUE_LOOKUP_CHUNK],
         )
@@ -940,7 +936,6 @@ async def entity_prune_pass(
         deadline stopped the drain with rows still queued.
     """
     from ...db_utils import retry_with_backoff
-    from ...memory_engine import acquire_with_retry
 
     examined = 0
     orphans_pruned = 0

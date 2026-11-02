@@ -50,7 +50,7 @@ python -m pytest hindsight-integrations/hermes/tests -q -o addopts=
 Run suites in separate interpreters: upstream tests stub Hermes modules; tests_hermes loads the real checkout.
 
 - Upstream status: fork-only; upstream multi-bank and minimum-score features are complementary, not accepted P5 replacements.
-- Last validated: upstream `6d8b096786df335fc2cc1e5d6662092f0e1b8694`; Fork merge candidate based on `3981e1d47ee1a4cdd2c50c368a5ab9f2089af585` (see sync record).
+- Last validated: upstream `bc5ea195a0fed1346ff171a5780bbb72a38c89c8`; Fork merge candidate based on `6e5e827b071255dd255759ba97dadb405ad762d4` (see sync record).
 - Feature docs: none — module docstrings and behavior tests carry the detailed contract.
 
 ### Real Hermes compatibility and retired-retain guards
@@ -91,7 +91,7 @@ HERMES_AGENT_ROOT=/path/to/hermes-agent python -m pytest hindsight-integrations/
 Compare collected node IDs before/after, not only total counts.
 
 - Upstream status: carried regression coverage and Fork integration seams.
-- Last validated: upstream `6d8b096786df335fc2cc1e5d6662092f0e1b8694`; Fork merge candidate based on `3981e1d47ee1a4cdd2c50c368a5ab9f2089af585`.
+- Last validated: upstream `bc5ea195a0fed1346ff171a5780bbb72a38c89c8`; Fork merge candidate based on `6e5e827b071255dd255759ba97dadb405ad762d4`.
 - Feature docs: none — regression tests specify the compatibility surface.
 
 ## Historical / obsolete units
@@ -124,5 +124,5 @@ python -m pytest hindsight-integrations/hermes/tests_hermes/test_pm_dependencies
 ```
 
 - Upstream status: upstream dependency policy explicitly accepted.
-- Last validated: upstream `6d8b096786df335fc2cc1e5d6662092f0e1b8694`; Fork merge candidate based on `3981e1d47ee1a4cdd2c50c368a5ab9f2089af585`.
+- Last validated: upstream `bc5ea195a0fed1346ff171a5780bbb72a38c89c8`; Fork merge candidate based on `6e5e827b071255dd255759ba97dadb405ad762d4`.
 - Feature docs: none — retirement boundary is complete here.

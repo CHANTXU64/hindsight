@@ -30,7 +30,7 @@ def test_hindsight_retain_tool_preserves_bank_tags_metadata_and_unicode(provider
         },
     )
 
-    assert "Memory stored successfully" in result
+    assert "Memory queued for storage" in result  # retain_async defaults to true
     call = provider._client.aretain_batch.call_args.kwargs
     assert call["bank_id"] == "Hermes"
     item = call["items"][0]

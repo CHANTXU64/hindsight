@@ -12,6 +12,8 @@ Carried over from the CHANTXU64/hermes-agent fork:
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from agent import secret_scope
@@ -37,7 +39,10 @@ def _make_hindsight_provider():
     provider._session_id = "old-sid"
     provider._parent_session_id = ""
     provider._document_id = "old-sid-20260101_000000_000000"
-    provider._session_turns = ["turn-1", "turn-2"]
+    provider._session_turns = [
+        json.dumps([{"role": "user", "content": f"turn-{n}"}, {"role": "assistant", "content": "ok"}])
+        for n in (1, 2)
+    ]
     provider._last_flushed_turn_count = 0
     provider._last_queued_flush_count = 2
     provider._retain_flush_pending = False
@@ -64,6 +69,7 @@ def _make_hindsight_provider():
     provider._retain_async = False
     provider._bank_id = "test-bank"
     provider._write_bank_ids = ["test-bank"]
+    provider._bank_source = "bank_id"
     # Carried recall state the switch path clears.
     provider._recall_cache = HindsightRecallCache(initial_session_id="old-sid")
     # Sync thread tracking (legacy alias at the writer).
@@ -182,7 +188,7 @@ def test_hindsight_retain_shaping_is_not_re_read_from_the_default_profile_enviro
     provider = hindsight.HindsightMemoryProvider()
     provider._apply_retain_settings(cfg)
     assert provider._retain_tags == []
-    assert provider._observation_scopes is None
+    assert provider._observation_scopes == "shared"
     assert provider._retain_source == _DEFAULT_RETAIN_SOURCE
     assert (provider._retain_user_prefix, provider._retain_assistant_prefix) == ("User", "Assistant")
 

@@ -186,7 +186,7 @@ def _assert_cloud_client_dependency_declared_for_installer(tmp_path, monkeypatch
 
     declaration = read_python_declaration(Path(hindsight_module.__file__).parent)
     clients = [Requirement(spec) for spec in declaration.requirements if Requirement(spec).name == "hindsight-client"]
-    assert declaration.is_member and len(clients) == 1
+    assert declaration.installs_packages and len(clients) == 1
     floors = [Version(s.version) for s in clients[0].specifier if s.operator in (">=", "==", "~=")]
     assert floors and min(floors) >= Version(_MIN_CLIENT_VERSION)
 
@@ -208,10 +208,13 @@ def _assert_cloud_client_dependency_declared_for_installer(tmp_path, monkeypatch
     client = provider._get_client()
 
     assert isinstance(client, FakeHindsight)
+    from plugins.memory.hindsight import _USER_AGENT
+
     assert client.kwargs == {
         "base_url": "http://localhost:9999",
         "timeout": 120.0,
         "api_key": "test-key",
+        "user_agent": _USER_AGENT,
     }
 
 
@@ -324,7 +327,7 @@ class TestConfig:
         assert provider._recall_max_tokens == 4096
         assert provider._recall_max_input_chars == 800
         assert provider._tags is None
-        assert provider._observation_scopes is None
+        assert provider._observation_scopes == "shared"
         assert provider._recall_tags is None
         # Default recall narrowed to observation-only; world/experience are
         # aggregate facts that often crowd out concrete-event signal during
@@ -499,7 +502,7 @@ class TestToolHandlers:
         result = json.loads(provider.handle_tool_call(
             "hindsight_retain", {"content": "user likes dark mode"}
         ))
-        assert result["result"] == "Memory stored successfully."
+        assert result["result"] == "Memory queued for storage."  # retain_async defaults to true
         provider._client.aretain_batch.assert_called_once()
         call_kwargs = provider._client.aretain_batch.call_args.kwargs
         assert call_kwargs["bank_id"] == "test-bank"
@@ -515,7 +518,7 @@ class TestToolHandlers:
         result = json.loads(provider.handle_tool_call(
             "hindsight_retain", {"content": "user likes dark mode"}
         ))
-        assert result["result"] == "Memory stored successfully."
+        assert result["result"] == "Memory queued for storage."  # retain_async defaults to true
         item = provider._client.aretain_batch.call_args.kwargs["items"][0]
         # Non-temporal retains still carry a defaulted event timestamp so the
         # server can resolve any relative time phrases (#93568).
@@ -526,7 +529,7 @@ class TestToolHandlers:
             "hindsight_retain",
             {"content": "user visited Paris", "occurred_at": "2026-03-03"},
         ))
-        assert result["result"] == "Memory stored successfully."
+        assert result["result"] == "Memory queued for storage."  # retain_async defaults to true
         item = provider._client.aretain_batch.call_args.kwargs["items"][0]
         assert item["timestamp"] == "2026-03-03"
 
@@ -583,11 +586,9 @@ class TestToolHandlers:
         second_client.arecall.return_value = SimpleNamespace(
             results=[SimpleNamespace(text="Recovered memory")]
         )
-        clients = iter([first_client, second_client])
-
         provider._mode = "local_embedded"
         provider._client = first_client
-        monkeypatch.setattr(provider, "_get_client", lambda: next(clients))
+        monkeypatch.setattr(provider, "_new_embedded_client", lambda: second_client)
 
         result = json.loads(provider.handle_tool_call(
             "hindsight_recall", {"query": "test"}
@@ -675,11 +676,12 @@ class TestSyncTurn:
         assert item["context"] == "conversation between Hermes Agent and the User"
         assert item["tags"] == ["conv", "session1", "session:session-1"]
         content = json.loads(item["content"])
-        assert len(content) == 1
-        assert content[0][0]["role"] == "user"
-        assert content[0][0]["content"] == "User (fakeusername): hello"
-        assert content[0][1]["role"] == "assistant"
-        assert content[0][1]["content"] == "Assistant (fakeassistantname): hi there"
+        # One flat message array: the server chunks by turn only for a list of messages.
+        assert len(content) == 2
+        assert content[0]["role"] == "user"
+        assert content[0]["content"] == "User (fakeusername): hello"
+        assert content[1]["role"] == "assistant"
+        assert content[1]["content"] == "Assistant (fakeassistantname): hi there"
         assert item["metadata"]["source"] == "hermes"
         assert item["metadata"]["session_id"] == "session-1"
         assert item["metadata"]["platform"] == "discord"
@@ -692,8 +694,8 @@ class TestSyncTurn:
         assert item["metadata"]["agent_identity"] == "fakeassistantname"
         assert item["metadata"]["turn_index"] == "1"
         assert item["metadata"]["message_count"] == "2"
-        assert content[0][0]["timestamp"] == event_time.isoformat(timespec="seconds")
-        assert content[0][1]["timestamp"] == event_time.isoformat(timespec="seconds")
+        assert content[0]["timestamp"] == event_time.isoformat(timespec="seconds")
+        assert content[1]["timestamp"] == event_time.isoformat(timespec="seconds")
         assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", item["metadata"]["retained_at"])
         assert item["timestamp"] == event_time.isoformat(timespec="seconds")
 
@@ -949,9 +951,12 @@ class TestSessionSwitchBufferFlush:
 
 class TestUpdateModeAppendCapability:
     def _clear_capability_cache(self):
-        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        from plugins.memory.hindsight import (
+            _append_capability_cache, _append_capability_lock, _append_probe_unreachable_at,
+        )
         with _append_capability_lock:
             _append_capability_cache.clear()
+            _append_probe_unreachable_at.clear()
 
     def test_legacy_api_falls_back_to_per_process_doc_id(self, provider, monkeypatch):
         """API returns no /version (or pre-0.5.0) — sync_turn must use the

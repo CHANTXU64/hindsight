@@ -1135,11 +1135,13 @@ def test_memory_manager_timeout_invalidates_late_hindsight_snapshot(
     )
     assert result == ""
 
-    thread = manager._external_prefetch_threads[provider.name]
+    threads = [t for t in threading.enumerate() if t.name == f"memory-prefetch-{provider.name}"]
+    assert threads
     release_recall.set()
-    thread.join(timeout=5.0)
+    for thread in threads:
+        thread.join(timeout=5.0)
 
-    assert not thread.is_alive()
+    assert not any(thread.is_alive() for thread in threads)
     assert provider._recall_cache.result == ""
     assert provider._recall_cache.snapshot is None
 
